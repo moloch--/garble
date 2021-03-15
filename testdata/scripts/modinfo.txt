@@ -7,7 +7,7 @@ cmp stderr main.stderr
 
 [short] stop # no need to verify this with -short
 
-exec go build
+go build
 exec ./main
 cmp stderr main.stderr-orig
 binsubstr main$exe '(devel)'
@@ -15,7 +15,7 @@ binsubstr main$exe '(devel)'
 -- go.mod --
 module test/main
 
-go 1.15
+go 1.16
 -- main.go --
 package main
 

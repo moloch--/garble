@@ -2,7 +2,7 @@
 
 	GO111MODULE=on go get mvdan.cc/garble
 
-Obfuscate Go code by wrapping the Go toolchain. Requires Go 1.15 or later.
+Obfuscate Go code by wrapping the Go toolchain. Requires Go 1.16 or later.
 
 	garble build [build flags] [packages]
 
@@ -36,29 +36,29 @@ order to:
 
 By default, the tool obfuscates the packages under the current module. If not
 running in module mode, then only the main package is obfuscated. To specify
-what packages to obfuscate, set `GOPRIVATE`, documented at `go help module-private`.
+what packages to obfuscate, set `GOPRIVATE`, documented at `go help private`.
 
 Note that commands like `garble build` will use the `go` version found in your
 `$PATH`. To use different versions of Go, you can
 [install them](https://golang.org/doc/manage-install#installing-multiple)
-and set up `$PATH` with them. For example, for Go 1.15.8:
+and set up `$PATH` with them. For example, for Go 1.16.1:
 
 ```sh
-$ go get golang.org/dl/go1.15.8
-$ go1.15.8 download
-$ PATH=$(go1.15.8 env GOROOT)/bin:${PATH} garble build
+$ go get golang.org/dl/go1.16.1
+$ go1.16.1 download
+$ PATH=$(go1.16.1 env GOROOT)/bin:${PATH} garble build
 ```
 
 You can also declare a function to make multiple uses simpler:
 
 ```sh
 $ withgo() {
-        local gocmd=go${1}
-        shift
+	local gocmd=go${1}
+	shift
 
-        PATH=$(${gocmd} env GOROOT)/bin:${PATH} "$@"
+	PATH=$(${gocmd} env GOROOT)/bin:${PATH} "$@"
 }
-$ withgo 1.15.8 garble build
+$ withgo 1.16.1 garble build
 ```
 
 ### Caveats
@@ -69,29 +69,26 @@ to document the current shortcomings of this tool.
 * Exported methods are never obfuscated at the moment, since they could
   be required by interfaces and reflection. This area is a work in progress.
 
-* Functions implemented outside Go, such as assembly, aren't obfuscated since we
-  currently only transform the input Go source.
-
 * Go plugins are not currently supported; see [#87](https://github.com/burrowers/garble/issues/87).
 
 * There are cases where garble is a little too agressive with obfuscation, this may lead to identifiers getting obfuscated which are needed for reflection, e.g. to parse JSON into a struct; see [#162](https://github.com/burrowers/garble/issues/162). To work around this you can pass a hint to garble, that an type is used for reflection via passing it to `reflect.TypeOf` or `reflect.ValueOf` in the same file:
-    ```go
-    // this is used for parsing json
-    type Message struct {
-        Command string
-        Args    string
-    }
+	```go
+	// this is used for parsing json
+	type Message struct {
+		Command string
+		Args    string
+	}
 
-    // never obfuscate the Message type
-    var _ = reflect.TypeOf(Message{})
-    ```
+	// never obfuscate the Message type
+	var _ = reflect.TypeOf(Message{})
+	```
 
 ### Tiny Mode
 
 When the `-tiny` flag is passed, extra information is stripped from the resulting
-Go binary. This includes line numbers, filenames, and code in the runtime the
+Go binary. This includes line numbers, filenames, and code in the runtime that
 prints panics, fatal errors, and trace/debug info. All in all this can make binaries
-6-10% smaller in our testing.
+2-5% smaller in our testing.
 
 Note: if `-tiny` is passed, no panics, fatal errors will ever be printed, but they can
 still be handled internally with `recover` as normal. In addition, the `GODEBUG`

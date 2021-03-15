@@ -39,8 +39,6 @@ type sharedCache struct {
 	// Once https://github.com/golang/go/issues/37475 is fixed, we
 	// can likely just use that.
 	BinaryContentID []byte
-
-	MainImportPath string // TODO: remove with TOOLEXEC_IMPORTPATH
 }
 
 var cache *sharedCache
@@ -92,7 +90,6 @@ type flagOptions struct {
 	GarbleDir      string
 	DebugDir       string
 	Seed           []byte
-	Random         bool
 }
 
 // setFlagOptions sets flagOptions from the user supplied flags.
@@ -117,17 +114,17 @@ func setFlagOptions() error {
 			return fmt.Errorf("error generating random seed: %v", err)
 		}
 
-		opts.Random = true
-
-	} else {
+	} else if len(flagSeed) > 0 {
+		// We expect unpadded base64, but to be nice, accept padded
+		// strings too.
 		flagSeed = strings.TrimRight(flagSeed, "=")
 		seed, err := base64.RawStdEncoding.DecodeString(flagSeed)
 		if err != nil {
 			return fmt.Errorf("error decoding seed: %v", err)
 		}
 
-		if len(seed) != 0 && len(seed) < 8 {
-			return fmt.Errorf("the seed needs to be at least 8 bytes, but is only %v bytes", len(seed))
+		if len(seed) < 8 {
+			return fmt.Errorf("-seed needs at least 8 bytes, have %d", len(seed))
 		}
 
 		opts.Seed = seed
@@ -158,10 +155,12 @@ func setFlagOptions() error {
 type listedPackage struct {
 	Name       string
 	ImportPath string
+	ForTest    string
 	Export     string
 	BuildID    string
 	Deps       []string
 	ImportMap  map[string]string
+	Standard   bool
 
 	Dir     string
 	GoFiles []string
@@ -172,15 +171,15 @@ type listedPackage struct {
 
 	GarbleActionID []byte
 
-	// TODO(mvdan): reuse this field once TOOLEXEC_IMPORTPATH is used
-	private bool
+	Private bool
 }
 
 func (p *listedPackage) obfuscatedImportPath() string {
-	if p.Name == "main" || !isPrivate(p.ImportPath) {
+	if p.Name == "main" || p.Name == "embed" || !p.Private {
 		return p.ImportPath
 	}
 	newPath := hashWith(p.GarbleActionID, p.ImportPath)
+	// log.Printf("%q hashed with %x to %q", p.ImportPath, p.GarbleActionID, newPath)
 	return newPath
 }
 
@@ -218,26 +217,12 @@ func setListedPackages(patterns []string) error {
 			return err
 		}
 		if pkg.Export != "" {
-			buildID := pkg.BuildID
-			if buildID == "" {
-				// go list only includes BuildID in 1.16+
-				buildID, err = buildidOf(pkg.Export)
-				if err != nil {
-					panic(err) // shouldn't happen
-				}
-			}
-			actionID := decodeHash(splitActionID(buildID))
+			actionID := decodeHash(splitActionID(pkg.BuildID))
 			h := sha256.New()
 			h.Write(actionID)
 			h.Write(cache.BinaryContentID)
 
 			pkg.GarbleActionID = h.Sum(nil)[:buildIDComponentLength]
-		}
-		if pkg.Name == "main" {
-			if cache.MainImportPath != "" {
-				return fmt.Errorf("found two main packages: %s %s", cache.MainImportPath, pkg.ImportPath)
-			}
-			cache.MainImportPath = pkg.ImportPath
 		}
 		cache.ListedPackages[pkg.ImportPath] = &pkg
 	}
@@ -248,8 +233,13 @@ func setListedPackages(patterns []string) error {
 
 	anyPrivate := false
 	for path, pkg := range cache.ListedPackages {
-		if isPrivate(path) {
-			pkg.private = true
+		// If "GOPRIVATE=foo/bar", "foo/bar_test" is also private.
+		if pkg.ForTest != "" {
+			path = pkg.ForTest
+		}
+		// Test main packages like "foo/bar.test" are always private.
+		if (pkg.Name == "main" && strings.HasSuffix(path, ".test")) || isPrivate(path) {
+			pkg.Private = true
 			anyPrivate = true
 		}
 	}
@@ -258,11 +248,11 @@ func setListedPackages(patterns []string) error {
 		return fmt.Errorf("GOPRIVATE=%q does not match any packages to be built", os.Getenv("GOPRIVATE"))
 	}
 	for path, pkg := range cache.ListedPackages {
-		if pkg.private {
+		if pkg.Private {
 			continue
 		}
 		for _, depPath := range pkg.Deps {
-			if cache.ListedPackages[depPath].private {
+			if cache.ListedPackages[depPath].Private {
 				return fmt.Errorf("public package %q can't depend on obfuscated package %q (matched via GOPRIVATE=%q)",
 					path, depPath, os.Getenv("GOPRIVATE"))
 			}
