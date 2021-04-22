@@ -1,28 +1,37 @@
 ! garble
 stderr -count=1 'Usage'
-stderr 'garble \[flags\] build'
+stderr 'garble \[garble flags\] command'
 ! stderr 'usage: go build'
 ! stdout .
 
 ! garble -h
-stderr 'garble \[flags\] build'
+stderr 'garble \[garble flags\] command'
 ! stdout .
 
 ! garble help
-stderr 'garble \[flags\] build'
+stderr 'garble \[garble flags\] command'
+! stdout .
+
+! garble help foo bar
+stderr 'does not take arguments'
 ! stdout .
 
 ! garble build -h
-stderr 'garble \[flags\] build'
+stderr 'garble \[garble flags\] command'
 ! stderr 'usage: go build'
 ! stdout .
 
 ! garble -badflag
-stderr 'garble \[flags\] build'
+stderr 'flag provided but not defined'
+stderr 'garble \[garble flags\] command'
 ! stdout .
 
 ! garble badcmd
 stderr 'unknown command'
+
+! garble build -badflag
+stderr 'usage: go build' # TODO: is this confusing?
+! stdout .
 
 [!windows] ! garble /does/not/exist/compile
 [windows] ! garble C:\does\not\exist\compile
@@ -36,3 +45,9 @@ stderr 'does not take arguments'
 
 ! garble version arg
 stderr 'does not take arguments'
+
+# We need a dummy module for "garble build -badflag".
+-- go.mod --
+module dummy
+-- dummy.go --
+package dummy

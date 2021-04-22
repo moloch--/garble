@@ -3,12 +3,10 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,9 +25,9 @@ type sharedCache struct {
 
 	Options flagOptions // garble options being used, i.e. our own flags
 
-	// ListedPackages contains data obtained via 'go list -json -export -deps'. This
-	// allows us to obtain the non-garbled export data of all dependencies, useful
-	// for type checking of the packages as we obfuscate them.
+	// ListedPackages contains data obtained via 'go list -json -export -deps'.
+	// This allows us to obtain the non-obfuscated export data of all dependencies,
+	// useful for type checking of the packages as we obfuscate them.
 	ListedPackages map[string]*listedPackage
 
 	// We can't rely on the module version to exist, because it's
@@ -39,6 +37,13 @@ type sharedCache struct {
 	// Once https://github.com/golang/go/issues/37475 is fixed, we
 	// can likely just use that.
 	BinaryContentID []byte
+
+	// From "go env", primarily.
+	GoEnv struct {
+		GOPRIVATE string // Set to the module path as a fallback.
+		GOMOD     string
+		GOVERSION string
+	}
 }
 
 var cache *sharedCache
@@ -65,7 +70,7 @@ func saveSharedCache() (string, error) {
 	if cache == nil {
 		panic("saving a missing cache?")
 	}
-	dir, err := ioutil.TempDir("", "garble-shared")
+	dir, err := os.MkdirTemp("", "garble-shared")
 	if err != nil {
 		return "", err
 	}
@@ -175,7 +180,7 @@ type listedPackage struct {
 }
 
 func (p *listedPackage) obfuscatedImportPath() string {
-	if p.Name == "main" || p.Name == "embed" || !p.Private {
+	if p.Name == "main" || p.ImportPath == "embed" || !p.Private {
 		return p.ImportPath
 	}
 	newPath := hashWith(p.GarbleActionID, p.ImportPath)
@@ -218,11 +223,7 @@ func setListedPackages(patterns []string) error {
 		}
 		if pkg.Export != "" {
 			actionID := decodeHash(splitActionID(pkg.BuildID))
-			h := sha256.New()
-			h.Write(actionID)
-			h.Write(cache.BinaryContentID)
-
-			pkg.GarbleActionID = h.Sum(nil)[:buildIDComponentLength]
+			pkg.GarbleActionID = addGarbleToBuildIDComponent(actionID)
 		}
 		cache.ListedPackages[pkg.ImportPath] = &pkg
 	}
