@@ -49,7 +49,12 @@ func printFile(file1 *ast.File) ([]byte, error) {
 	// and those are the only source of truth that go/printer uses.
 	// So the positions of the comments in the given file are wrong.
 	// The only way we can get the final ones is to parse again.
-	file2, err := parser.ParseFile(fset, absFilename, src, parser.ParseComments)
+	//
+	// We use an empty filename here.
+	// Syntax errors should be rare, and when they do happen,
+	// we don't want to point to the original source file on disk.
+	// That would be confusing, as we've changed the source in memory.
+	file2, err := parser.ParseFile(fset, "", src, parser.ParseComments)
 	if err != nil {
 		return nil, fmt.Errorf("re-parse error: %w", err)
 	}
@@ -130,17 +135,14 @@ func printFile(file1 *ast.File) ([]byte, error) {
 		buf2.Write(src[copied:comment.offset])
 		copied = comment.offset
 
+		// We assume that all comments are of the form "/*text*/".
 		// Make sure there is whitespace at either side of a comment.
 		// Otherwise, we could change the syntax of the program.
 		// Inserting "/*text*/" in "a/b" // must be "a/ /*text*/ b",
 		// as "a//*text*/b" is tokenized as a "//" comment.
 		buf2.WriteByte(' ')
 		buf2.WriteString(comment.text)
-		if strings.HasPrefix(comment.text, "//") {
-			buf2.WriteByte('\n')
-		} else {
-			buf2.WriteByte(' ')
-		}
+		buf2.WriteByte(' ')
 	}
 	buf2.Write(src[copied:])
 	return buf2.Bytes(), nil

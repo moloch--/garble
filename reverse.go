@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/parser"
-	"go/token"
+	"go/types"
 	"io"
 	"os"
 	"path/filepath"
@@ -53,54 +53,85 @@ func commandReverse(args []string) error {
 	// export data only exposes exported names. Parsing Go files is cheap,
 	// so it's unnecessary to try to avoid this cost.
 	var replaces []string
-	fset := token.NewFileSet()
 
 	for _, lpkg := range cache.ListedPackages {
 		if !lpkg.Private {
 			continue
 		}
-		addReplace := func(str string) {
-			replaces = append(replaces, hashWith(lpkg.GarbleActionID, str), str)
+		curPkg = lpkg
+
+		addReplace := func(hash []byte, str string) {
+			if hash == nil {
+				hash = lpkg.GarbleActionID
+			}
+			replaces = append(replaces, hashWith(hash, str), str)
 		}
 
 		// Package paths are obfuscated, too.
-		addReplace(lpkg.ImportPath)
+		addReplace(nil, lpkg.ImportPath)
 
+		var files []*ast.File
 		for _, goFile := range lpkg.GoFiles {
 			fullGoFile := filepath.Join(lpkg.Dir, goFile)
 			file, err := parser.ParseFile(fset, fullGoFile, nil, 0)
 			if err != nil {
 				return err
 			}
+			files = append(files, file)
+		}
+		tf := newTransformer()
+		if err := tf.typecheck(files); err != nil {
+			return err
+		}
+		for i, file := range files {
+			goFile := lpkg.GoFiles[i]
 			ast.Inspect(file, func(node ast.Node) bool {
 				switch node := node.(type) {
 
 				// Replace names.
 				// TODO: do var names ever show up in output?
 				case *ast.FuncDecl:
-					addReplace(node.Name.Name)
+					addReplace(nil, node.Name.Name)
 				case *ast.TypeSpec:
-					addReplace(node.Name.Name)
+					addReplace(nil, node.Name.Name)
 				case *ast.Field:
 					for _, name := range node.Names {
-						addReplace(name.Name)
+						obj, _ := tf.info.ObjectOf(name).(*types.Var)
+						if obj == nil || !obj.IsField() {
+							continue
+						}
+						strct := tf.fieldToStruct[obj]
+						if strct == nil {
+							panic("could not find for " + name.Name)
+						}
+						fieldsHash := []byte(strct.String())
+						hashToUse := addGarbleToHash(fieldsHash)
+						addReplace(hashToUse, name.Name)
 					}
 
 				case *ast.CallExpr:
-					// continues below
-				default:
-					return true
+					// Reverse position information of call sites.
+					pos := fset.Position(node.Pos())
+					origPos := fmt.Sprintf("%s:%d", goFile, pos.Offset)
+					newFilename := hashWith(lpkg.GarbleActionID, origPos) + ".go"
+
+					// Do "obfuscated.go:1", corresponding to the call site's line.
+					// Most common in stack traces.
+					replaces = append(replaces,
+						newFilename+":1",
+						fmt.Sprintf("%s/%s:%d", lpkg.ImportPath, goFile, pos.Line),
+					)
+
+					// Do "obfuscated.go" as a fallback.
+					// Most useful in build errors in obfuscated code,
+					// since those might land on any line.
+					// Any ":N" line number will end up being useless,
+					// but at least the filename will be correct.
+					replaces = append(replaces,
+						newFilename,
+						fmt.Sprintf("%s/%s", lpkg.ImportPath, goFile),
+					)
 				}
-
-				// Reverse position information.
-				pos := fset.Position(node.Pos())
-				origPos := fmt.Sprintf("%s:%d", goFile, pos.Offset)
-				newPos := hashWith(lpkg.GarbleActionID, origPos) + ".go:1"
-
-				replaces = append(replaces,
-					newPos,
-					fmt.Sprintf("%s/%s:%d", lpkg.ImportPath, goFile, pos.Line),
-				)
 
 				return true
 			})
@@ -118,6 +149,7 @@ func commandReverse(args []string) error {
 		}
 		return nil
 	}
+	// TODO: cover this code in the tests too
 	anyModified := false
 	for _, path := range args {
 		f, err := os.Open(path)

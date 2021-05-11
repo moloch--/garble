@@ -1,0 +1,230 @@
+env GOPRIVATE=test/main
+
+garble build
+exec ./main
+cmp stdout main.stdout
+
+! binsubstr main$exe 'main.go' 'test/main' 'importedpkg.' 'DownstreamObfuscated' 'SiblingObfuscated' 'IndirectObfuscated' 'IndirectNamedWithoutReflect' 'AliasIndirectNamedWithReflect' 'AliasIndirectNamedWithoutReflect'
+binsubstr main$exe 'ReflectInDefined' 'ExportedField2' 'unexportedField2' 'IndirectUnobfuscated' 'IndirectNamedWithReflect'
+
+[short] stop # no need to verify this with -short
+
+# Check that the program works as expected without garble.
+go build
+exec ./main
+cmp stdout main.stdout
+
+-- go.mod --
+module test/main
+
+go 1.16
+-- main.go --
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"reflect"
+	"strings"
+
+	"test/main/importedpkg"
+	"test/main/importedpkg2"
+)
+
+func main() {
+	// Fields still work fine when they are not obfuscated.
+	fmt.Println(importedpkg.ReflectInDefinedVar.ExportedField2)
+	fmt.Println(importedpkg.ReflectInDefined{ExportedField2: 5})
+
+	// Type names are not obfuscated either, when reflection is used.
+	printfWithoutPackage("%T\n", importedpkg.ReflectTypeOf(2))
+	printfWithoutPackage("%T\n", importedpkg.ReflectTypeOfIndirect(4))
+
+	// More complex use of reflect.
+	v := importedpkg.ReflectValueOfVar
+	printfWithoutPackage("%#v\n", v)
+	method := reflect.ValueOf(&v).MethodByName("ExportedMethodName")
+	if method.IsValid() {
+		fmt.Println(method.Call(nil))
+	} else {
+		fmt.Println("method not found")
+	}
+
+	// Use of a common library using reflect, encoding/json.
+	// TODO: remove the TypeOf hint once we detect json.Marshal.
+	_ = reflect.TypeOf(EncodingT{})
+	enc, _ := json.Marshal(EncodingT{Foo: 3})
+	println(string(enc))
+
+	// Another complex case, involving embedding and another package.
+	outer := &importedpkg.EmbeddingOuter{}
+	outer.InnerField = 3
+	enc, _ = json.Marshal(outer)
+	println(string(enc))
+
+	// An edge case; the struct type is defined in a different package.
+	// Note that the struct type is unnamed, but it still has named fields.
+	// We only use reflection on it here, not the declaring package.
+	// As such, we should obfuscate the field name.
+	// Simply using the field name here used to cause build failures.
+	_ = reflect.TypeOf(importedpkg.UnnamedWithDownstreamReflect{})
+	fmt.Printf("%v\n", importedpkg.UnnamedWithDownstreamReflect{
+		DownstreamObfuscated: "downstream",
+	})
+
+	// An edge case; the struct type is defined in package importedpkg2.
+	// importedpkg2 does not use reflection on it, so it's not obfuscated there.
+	// importedpkg uses reflection on a type containing ReflectInSiblingImport.
+	// If our logic is incorrect, we might inconsistently obfuscate the type.
+	// We should not obfuscate it when building any package.
+	fmt.Printf("%v\n", importedpkg2.ReflectInSiblingImport{
+		SiblingObfuscated: "sibling",
+	})
+
+	// Using type aliases as both regular fields, and embedded fields.
+	var emb EmbeddingIndirect
+	emb.With.IndirectUnobfuscated = "indirect-with"
+	emb.Without.IndirectObfuscated = "indirect-without"
+	fmt.Printf("%v\n", emb)
+	printfWithoutPackage("%#v\n", emb.With)
+
+	// TODO: don't obfuscate the embedded field name here
+	// printfWithoutPackage("%#v\n", importedpkg.ReflectEmbeddingAlias{})
+}
+
+type EmbeddingIndirect struct {
+	// With field names, to test selectors above.
+	With importedpkg.AliasIndirectNamedWithReflect
+	Without importedpkg.AliasIndirectNamedWithoutReflect
+
+	// Embedding used to crash garble, too.
+	importedpkg.AliasIndirectNamedWithReflect
+}
+
+func printfWithoutPackage(format string, v interface{}) {
+	s := fmt.Sprintf(format, v)
+	if i := strings.IndexByte(s, '.'); i > 0 {
+		s = s[i+1:]
+	}
+	fmt.Print(s)
+}
+
+type EncodingT struct {
+	Foo int
+}
+
+type RecursiveStruct struct {
+	*RecursiveStruct
+	list []RecursiveStruct
+}
+
+// This could crash or hang if we don't deal with loops.
+var _ = reflect.TypeOf(RecursiveStruct{})
+
+-- importedpkg/imported.go --
+package importedpkg
+
+import (
+	"reflect"
+
+	"test/main/importedpkg/indirect"
+	"test/main/importedpkg2"
+)
+
+type ReflectTypeOf int
+
+var _ = reflect.TypeOf(ReflectTypeOf(0))
+
+type ReflectTypeOfIndirect int
+
+var _ = reflect.TypeOf(new([]*ReflectTypeOfIndirect))
+
+type ReflectValueOf struct {
+	ExportedField string
+
+	unexportedField string
+}
+
+func (r *ReflectValueOf) ExportedMethodName() string { return "method: " + r.ExportedField }
+
+var ReflectValueOfVar = ReflectValueOf{ExportedField: "abc"}
+
+var _ = reflect.TypeOf(ReflectValueOfVar)
+
+type ReflectInDefined struct {
+	ExportedField2 int
+
+	unexportedField2 int
+
+	importedpkg2.ReflectInSiblingImport
+}
+
+var ReflectInDefinedVar = ReflectInDefined{ExportedField2: 9000}
+
+var _ = reflect.TypeOf(ReflectInDefinedVar)
+
+var _ = reflect.TypeOf([]*struct{EmbeddingOuter}{})
+
+type EmbeddingOuter struct {
+	EmbeddingInner
+	Anon struct {
+		AnonField int
+	}
+}
+
+type EmbeddingInner struct {
+	InnerField int
+}
+
+type UnnamedWithDownstreamReflect = struct {
+	DownstreamObfuscated string
+}
+
+type (
+	AliasIndirectNamedWithReflect = indirect.IndirectNamedWithReflect
+	AliasIndirectNamedWithoutReflect = indirect.IndirectNamedWithoutReflect
+)
+
+var _ = reflect.TypeOf(ReflectEmbeddingAlias{})
+
+type ReflectEmbeddingAlias struct {
+	ReflectEmbeddedAlias
+}
+
+type ReflectEmbeddedAlias = ReflectEmbeddingNamed
+
+type ReflectEmbeddingNamed struct{}
+
+-- importedpkg2/imported2.go --
+package importedpkg2
+
+type ReflectInSiblingImport struct {
+	SiblingObfuscated string
+}
+
+-- importedpkg/indirect/indirect.go --
+package indirect
+
+import "reflect"
+
+var _ = reflect.TypeOf(IndirectNamedWithReflect{})
+
+type IndirectNamedWithReflect struct {
+	IndirectUnobfuscated string
+}
+
+type IndirectNamedWithoutReflect struct {
+	IndirectObfuscated string
+}
+
+-- main.stdout --
+9000
+{5 0 {}}
+ReflectTypeOf
+ReflectTypeOfIndirect
+ReflectValueOf{ExportedField:"abc", unexportedField:""}
+[method: abc]
+{downstream}
+{sibling}
+{{indirect-with} {indirect-without} {}}
+IndirectNamedWithReflect{IndirectUnobfuscated:"indirect-with"}
