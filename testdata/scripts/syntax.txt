@@ -100,6 +100,11 @@ func main() {
 	println(extra.Func())
 	sub.Test()
 	neverInlined()
+
+	_ = sub.EmbeddingExternalForeignAlias{
+		ExternalForeignAlias: nil,
+		Reader:       nil,
+	}
 }
 
 -- scopes.go --
@@ -135,6 +140,12 @@ func input(localNameParam string) (localNameReturn string) { return localNamePar
 -- sub/names.go --
 package sub
 
+import (
+	"io"
+
+	"test/main/external"
+)
+
 var someGlobalVar0 = "0"
 var someGlobalVar1 = "1"
 var someGlobalVar2 = "2"
@@ -165,6 +176,51 @@ type EmbeddedAlias = EmbeddedStruct
 type EmbeddedStruct struct {
 	Foo int
 }
+
+// We obfuscate the name foreignAlias, but not the name Reader,
+// as it's not declared in a private package.
+// Both names must do the same when used as struct fields,
+// both in the struct declaration and in the composite literal below.
+type embeddingForeignAlias struct {
+	foreignAlias
+	io.Reader
+}
+
+type foreignAlias = io.Reader
+
+var _ = embeddingForeignAlias{
+	foreignAlias: nil,
+	Reader: nil,
+}
+
+// Similar to embeddingForeignAlias,
+// but the alias is declared in a dependency,
+// and this type is used in a dependent.
+type EmbeddingExternalForeignAlias struct {
+	external.ExternalForeignAlias
+	io.Reader
+}
+
+// Like the cases above,
+// but this time the alias doesn't rename its destination named type.
+// We can't tell this apart from "struct { io.Reader }" at the type info level.
+// It's fine to ignore the alias entirely, in this case.
+type embeddingAliasSameName struct {
+	external.Reader
+}
+
+var _ = embeddingAliasSameName{
+	Reader: nil,
+}
+
+-- external/external.go --
+package external
+
+import "io"
+
+type ExternalForeignAlias = io.Reader
+
+type Reader = io.Reader
 
 -- main.stderr --
 nil case

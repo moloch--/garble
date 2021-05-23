@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -64,8 +63,6 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `
 Garble obfuscates Go code by wrapping the Go toolchain.
 
-Usage:
-
 	garble [garble flags] command [arguments]
 
 For example, to build an obfuscated program:
@@ -78,7 +75,7 @@ The following commands are supported:
 	test [packages]    wraps "go test"
 	reverse [files]    de-obfuscates output such as stack traces
 
-garble accepts the following flags:
+garble accepts the following flags before a command:
 
 `[1:])
 	flagSet.PrintDefaults()
@@ -221,27 +218,25 @@ func main1() int {
 		return 2
 	}
 	if err := mainErr(args); err != nil {
-		switch err {
-		case flag.ErrHelp:
-			usage()
-			return 2
-		case errJustExit:
-		default:
-			fmt.Fprintln(os.Stderr, err)
+		if code, ok := err.(errJustExit); ok {
+			os.Exit(int(code))
+		}
+		fmt.Fprintln(os.Stderr, err)
 
-			// If the build failed and a random seed was used,
-			// the failure might not reproduce with a different seed.
-			// Print it before we exit.
-			if flagSeed == "random" {
-				fmt.Fprintf(os.Stderr, "random seed: %s\n", base64.RawStdEncoding.EncodeToString(opts.Seed))
-			}
+		// If the build failed and a random seed was used,
+		// the failure might not reproduce with a different seed.
+		// Print it before we exit.
+		if flagSeed == "random" {
+			fmt.Fprintf(os.Stderr, "random seed: %s\n", base64.RawStdEncoding.EncodeToString(opts.Seed))
 		}
 		return 1
 	}
 	return 0
 }
 
-var errJustExit = errors.New("")
+type errJustExit int
+
+func (e errJustExit) Error() string { return fmt.Sprintf("exit: %d", e) }
 
 func goVersionOK() bool {
 	const (
@@ -309,7 +304,8 @@ func mainErr(args []string) error {
 		if len(args) > 0 {
 			return fmt.Errorf("the help command does not take arguments")
 		}
-		return flag.ErrHelp
+		usage()
+		return errJustExit(2)
 	case "version":
 		if len(args) > 0 {
 			return fmt.Errorf("the version command does not take arguments")
@@ -400,6 +396,16 @@ func mainErr(args []string) error {
 	return nil
 }
 
+func hasHelpFlag(flags []string) bool {
+	for _, f := range flags {
+		switch f {
+		case "-h", "-help", "--help":
+			return true
+		}
+	}
+	return false
+}
+
 // toolexecCmd builds an *exec.Cmd which is set up for running "go <command>"
 // with -toolexec=garble and the supplied arguments.
 //
@@ -409,11 +415,15 @@ func toolexecCmd(command string, args []string) (*exec.Cmd, error) {
 	// Split the flags from the package arguments, since we'll need
 	// to run 'go list' on the same set of packages.
 	flags, args := splitFlagsFromArgs(args)
-	for _, f := range flags {
-		switch f {
-		case "-h", "-help", "--help":
-			return nil, flag.ErrHelp
-		}
+	if hasHelpFlag(flags) {
+		out, _ := exec.Command("go", command, "-h").CombinedOutput()
+		fmt.Fprintf(os.Stderr, `
+usage: garble [garble flags] %s [arguments]
+
+This command wraps "go %s". Below is its help:
+
+%s`[1:], command, command, out)
+		return nil, errJustExit(2)
 	}
 
 	if err := setFlagOptions(); err != nil {
@@ -436,7 +446,7 @@ func toolexecCmd(command string, args []string) (*exec.Cmd, error) {
 	}
 
 	if !goVersionOK() {
-		return nil, errJustExit
+		return nil, errJustExit(1)
 	}
 
 	var err error
@@ -670,9 +680,9 @@ func transformCompile(args []string) ([]string, error) {
 	newPaths := make([]string, 0, len(files))
 
 	for i, file := range files {
-		tf.handleDirectives(file.Comments)
-
 		name := filepath.Base(paths[i])
+		// TODO(mvdan): allow running handleDirectives and transformGo
+		// on runtime too, by splitting the conditionals here.
 		switch {
 		case curPkg.ImportPath == "runtime":
 			// strip unneeded runtime code
@@ -694,6 +704,7 @@ func transformCompile(args []string) ([]string, error) {
 		case strings.HasPrefix(name, "_cgo_"):
 			// Don't obfuscate cgo code, since it's generated and it gets messy.
 		default:
+			tf.handleDirectives(file.Comments)
 			file = tf.transformGo(file)
 		}
 		if newPkgPath != "" {
@@ -779,9 +790,6 @@ func (tf *transformer) handleDirectives(comments []*ast.CommentGroup) {
 				pkgPath, name = target[0], target[1]
 			}
 
-			if pkgPath == "runtime" && strings.HasPrefix(name, "cgo") {
-				continue // ignore cgo-generated linknames
-			}
 			lpkg, err := listPackage(pkgPath)
 			if err != nil {
 				// probably a made up symbol name, replace the comment
@@ -1052,10 +1060,16 @@ type transformer struct {
 	//    obfuscated, for caching reasons; see transformGo.
 	ignoreObjects map[types.Object]bool
 
-	// These fields are used to locate struct types from any of their field
-	// objects. Useful when obfuscating field names.
-	fieldToStruct  map[*types.Var]*types.Struct
+	// recordTypeDone helps avoid cycles in recordType.
 	recordTypeDone map[types.Type]bool
+
+	// fieldToStruct helps locate struct types from any of their field
+	// objects. Useful when obfuscating field names.
+	fieldToStruct map[*types.Var]*types.Struct
+
+	// fieldToAlias helps tell if an embedded struct field object is a type
+	// alias. Useful when obfuscating field names.
+	fieldToAlias map[*types.Var]*types.TypeName
 }
 
 // newTransformer helps initialize some maps.
@@ -1068,6 +1082,7 @@ func newTransformer() *transformer {
 		},
 		recordTypeDone: make(map[types.Type]bool),
 		fieldToStruct:  make(map[*types.Var]*types.Struct),
+		fieldToAlias:   make(map[*types.Var]*types.TypeName),
 	}
 }
 
@@ -1086,8 +1101,14 @@ func (tf *transformer) typecheck(files []*ast.File) error {
 			tf.recordType(obj.Type())
 		}
 	}
-	for _, obj := range tf.info.Uses {
+	for name, obj := range tf.info.Uses {
 		if obj != nil {
+			if obj, ok := obj.(*types.TypeName); ok && obj.IsAlias() {
+				vr, _ := tf.info.Defs[name].(*types.Var)
+				if vr != nil {
+					tf.fieldToAlias[vr] = obj
+				}
+			}
 			tf.recordType(obj.Type())
 		}
 	}
@@ -1148,25 +1169,46 @@ func (tf *transformer) transformGo(file *ast.File) *ast.File {
 		}
 		pkg := obj.Pkg()
 		if vr, ok := obj.(*types.Var); ok && vr.Embedded() {
+
 			// The docs for ObjectOf say:
 			//
 			//     If id is an embedded struct field, ObjectOf returns the
 			//     field (*Var) it defines, not the type (*TypeName) it uses.
 			//
 			// If this embedded field is a type alias, we want to
-			// handle that instead of treating it as the type the
-			// alias points to.
+			// handle the alias's TypeName instead of treating it as
+			// the type the alias points to.
 			//
 			// Alternatively, if we don't have an alias, we want to
 			// use the embedded type, not the field.
-			if tname, ok := tf.info.Uses[node].(*types.TypeName); ok && tname.IsAlias() {
+			if tname := tf.fieldToAlias[vr]; tname != nil {
+				if !tname.IsAlias() {
+					panic("fieldToAlias recorded a non-alias TypeName?")
+				}
 				obj = tname
 			} else {
 				named := namedType(obj.Type())
 				if named == nil {
 					return true // unnamed type (probably a basic type, e.g. int)
 				}
-				obj = named.Obj()
+				// If the field embeds an alias,
+				// and the field is declared in a dependency,
+				// fieldToAlias might not tell us about the alias.
+				// We lack the *ast.Ident for the field declaration,
+				// so we can't see it in types.Info.Uses.
+				//
+				// Instead, detect such a "foreign alias embed".
+				// If we embed a final named type,
+				// but the field name does not match its name,
+				// then it must have been done via an alias.
+				// We dig out the alias's TypeName via locateForeignAlias.
+				if named.Obj().Name() != node.Name {
+					tname := locateForeignAlias(vr.Pkg().Path(), node.Name)
+					tf.fieldToAlias[vr] = tname // to reuse it later
+					obj = tname
+				} else {
+					obj = named.Obj()
+				}
 			}
 			pkg = obj.Pkg()
 		}
@@ -1178,6 +1220,14 @@ func (tf *transformer) transformGo(file *ast.File) *ast.File {
 			// TODO: only do this when -buildmode is plugin? what
 			// about other -buildmode options?
 			return true // could be a Go plugin API
+		}
+
+		if pkg.Path() == "embed" {
+			// The Go compiler needs to detect types such as embed.FS.
+			// That will fail if we change the import path or type name.
+			// Leave it as is.
+			// Luckily, the embed package just declares the FS type.
+			return true
 		}
 
 		// We don't want to obfuscate this object.
@@ -1195,7 +1245,7 @@ func (tf *transformer) transformGo(file *ast.File) *ast.File {
 		}
 		hashToUse := lpkg.GarbleActionID
 
-		// log.Printf("%#v %T", node, obj)
+		// log.Printf("%s: %#v %T", fset.Position(node.Pos()), node, obj)
 		parentScope := obj.Parent()
 		switch obj := obj.(type) {
 		case *types.Var:
@@ -1325,6 +1375,44 @@ func (tf *transformer) transformGo(file *ast.File) *ast.File {
 	}
 
 	return astutil.Apply(file, pre, post).(*ast.File)
+}
+
+// locateForeignAlias finds the TypeName for an alias by the name aliasName,
+// which must be declared in one of the dependencies of dependentImportPath.
+func locateForeignAlias(dependentImportPath, aliasName string) *types.TypeName {
+	var found *types.TypeName
+	lpkg, err := listPackage(dependentImportPath)
+	if err != nil {
+		panic(err) // shouldn't happen
+	}
+	for _, importedPath := range lpkg.Imports {
+		pkg2, err := origImporter.ImportFrom(importedPath, opts.GarbleDir, 0)
+		if err != nil {
+			panic(err)
+		}
+		tname, ok := pkg2.Scope().Lookup(aliasName).(*types.TypeName)
+		if ok && tname.IsAlias() {
+			if found != nil {
+				// We assume that the alias is declared exactly
+				// once in the set of direct imports.
+				// This might not be the case, e.g. if two
+				// imports declare the same alias name.
+				//
+				// TODO: Think how we could solve that
+				// efficiently, if it happens in practice.
+				panic(fmt.Sprintf("found multiple TypeNames for %s", aliasName))
+			}
+			found = tname
+		}
+	}
+	if found == nil {
+		// This should never happen.
+		// If package A embeds an alias declared in a dependency,
+		// it must show up in the form of "B.Alias",
+		// so A must import B and B must declare "Alias".
+		panic(fmt.Sprintf("could not find TypeName for %s", aliasName))
+	}
+	return found
 }
 
 // recordIgnore adds any named types (including fields) under typ to
@@ -1642,7 +1730,7 @@ This is likely due to go not being installed/setup correctly.
 
 How to install Go: https://golang.org/doc/install
 `, err)
-		return errJustExit
+		return errJustExit(1)
 	}
 	if err := json.Unmarshal(out, &cache.GoEnv); err != nil {
 		return err
