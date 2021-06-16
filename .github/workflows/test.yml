@@ -5,9 +5,11 @@ on:
   pull_request:
     branches:
       - master
+
 name: Test
 jobs:
   test:
+    timeout-minutes: 61
     strategy:
       matrix:
         go-version: [1.16.x]
@@ -23,7 +25,7 @@ jobs:
     - name: Test
       run: |
         go version
-        go test ./...
+        go test -timeout 1h ./...
 
   test-gotip:
     runs-on: ubuntu-latest
@@ -50,7 +52,7 @@ jobs:
     - name: Test
       run: |
         go version
-        go test ./...
+        go test -timeout 1h ./...
 
   code-checks:
     runs-on: ubuntu-latest
