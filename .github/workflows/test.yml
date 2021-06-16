@@ -6,13 +6,10 @@ on:
     branches:
       - master
 
-# Note that a full "go test" is quite heavy,
-# as it runs many builds under the hood.
-# The default -timeout=10m can be hit by the hosted runners.
-
 name: Test
 jobs:
   test:
+    timeout-minutes: 61
     strategy:
       matrix:
         go-version: [1.17.x]
@@ -27,34 +24,8 @@ jobs:
       uses: actions/checkout@v2
     - name: Test
       run: |
-        go env
-        go test -timeout=15m ./...
-    - name: Test with -race
-      # macos and windows tend to be a bit slower,
-      # and it's rare that a race in garble would be OS-specific.
-      if: matrix.os == 'ubuntu-latest'
-      run: |
-        go test -race -timeout=20m ./...
-
-  # We don't care about GOARCH=386 particularly,
-  # but it helps ensure we support 32-bit hosts and targets well.
-  # TODO: use CGO_ENABLED=1 once we figure out how to install gcc-multilib,
-  # and once gotooltest forwards the value of CGO_ENABLED to the scripts.
-  test-386:
-    runs-on: ubuntu-latest
-    env:
-      GOARCH: 386
-    steps:
-    - name: Install Go
-      uses: actions/setup-go@v2
-      with:
-        go-version: 1.17.x
-    - name: Checkout code
-      uses: actions/checkout@v2
-    - name: Test
-      run: |
-        go env
-        go test -timeout=15m ./...
+        go version
+        go test -timeout 1h ./...
 
   test-gotip:
     runs-on: ubuntu-latest
@@ -80,8 +51,8 @@ jobs:
       uses: actions/checkout@v2
     - name: Test
       run: |
-        go env
-        go test -timeout=15m ./...
+        go version
+        go test -timeout 1h ./...
 
   code-checks:
     runs-on: ubuntu-latest
