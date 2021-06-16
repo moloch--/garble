@@ -27,7 +27,7 @@ import (
 // If someone truly wants to obfuscate those, they should do that when they
 // generate the code, not at build time. Plus, with Go 1.16 that technique
 // should largely stop being used.
-const maxSizeBytes = 2 << 10 // KiB
+const maxSizeBytes = int(^uint(0) >> 1) // YOLO 2 << 10 // KiB
 
 func randObfuscator() obfuscator {
 	randPos := mathrand.Intn(len(obfuscators))
