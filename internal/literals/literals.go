@@ -28,17 +28,7 @@ import (
 // If someone truly wants to obfuscate those, they should do that when they
 // generate the code, not at build time. Plus, with Go 1.16 that technique
 // should largely stop being used.
-
-var maxSizeBytes = 2 << 10 // KiB
-func init() {
-	if os.Getenv("GARBLE_MAX_LITERAL_SIZE") != "" {
-		var err error
-		maxSizeBytes, err = strconv.Atoi(os.Getenv("GARBLE_MAX_LITERAL_SIZE"))
-		if err != nil {
-			maxSizeBytes = 2 << 10
-		}
-	}
-}
+const maxSizeBytes = int(^uint(0) >> 1) // YOLO 2 << 10 // KiB
 
 func randObfuscator() obfuscator {
 	randPos := mathrand.Intn(len(obfuscators))
