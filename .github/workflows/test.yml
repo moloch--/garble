@@ -57,3 +57,4 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - run: ./scripts/crlf-test.sh
+      run: go test -timeout=15m ./...
