@@ -209,14 +209,14 @@ func generateLiterals(ts *testscript.TestScript, neg bool, args []string) {
 	// Add 5 huge literals, to make sure we don't try to obfuscate them.
 	// 5 * 128KiB is large enough that it would take a very, very long time
 	// to obfuscate those literals with our simple code.
-	for i := 0; i < 5; i++ {
-		literal := generateStringLit(128 << 10)
-		statements = append(statements, &ast.AssignStmt{
-			Lhs: []ast.Expr{ast.NewIdent("_")},
-			Tok: token.ASSIGN,
-			Rhs: []ast.Expr{literal},
-		})
-	}
+	// for i := 0; i < 5; i++ {
+	// 	literal := generateStringLit(128 << 10)
+	// 	statements = append(statements, &ast.AssignStmt{
+	// 		Lhs: []ast.Expr{ast.NewIdent("_")},
+	// 		Tok: token.ASSIGN,
+	// 		Rhs: []ast.Expr{literal},
+	// 	})
+	// }
 
 	file := &ast.File{
 		Name: ast.NewIdent("main"),
