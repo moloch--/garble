@@ -5,7 +5,7 @@ exec ./main$exe
 cmp stderr main.stderr
 
 binsubstr main$exe 'Skip this block' 'also skip this' 'skip typed const' 'skip typed var' 'skip typed var assign' 'stringTypeField strType' 'stringType lambda func return' 'testMap1 key' 'testMap2 key' 'testMap3 key' 'testMap1 value' 'testMap3 value' 'testMap1 new value' 'testMap3 new value' 'stringType func param' 'stringType return' 'skip untyped const'
-! binsubstr main$exe 'garbleDecrypt' 'Lorem' 'dolor' 'first assign' 'second assign' 'First Line' 'Second Line' 'map value' 'to obfuscate' 'also obfuscate' 'stringTypeField String'
+! binsubstr main$exe 'garbleDecrypt' 'Lorem' 'dolor' 'first assign' 'second assign' 'First Line' 'Second Line' 'map value' '1: literal in' 'an array' '2: literal in' 'a slice' 'to obfuscate' 'also obfuscate' 'stringTypeField String'
 
 [short] stop # checking that the build is reproducible is slow
 
@@ -88,6 +88,11 @@ const (
 	skip2 = "also skip this"
 )
 
+// We used to conver this to a var in an attempt of obfuscating the literal.
+// That would break the iota, which only works inside const declarations.
+// We only obfuscate constant declarations with string values, anyway.
+const fooTyped uint64 = 1 << iota
+
 const arrayLen = 4
 
 var array [arrayLen]byte
@@ -131,6 +136,13 @@ func main() {
 	typedTest()
 	constantTest()
 	byteTest()
+
+	strArray := [2]string{"1: literal in", "an array"}
+	println(strArray[0], strArray[1])
+	strSlice := []string{"2: literal in", "a slice"}
+	println(strSlice[0], strSlice[1])
+	emptyStrSlice := []string{""}
+	print(emptyStrSlice[0])
 }
 
 type stringType string
@@ -213,6 +225,9 @@ func constantTest() {
 	const impType = imported.ImportedType(3)
 }
 
+// TODO: this only tests, that we don't break byte slices 
+// it was verified manually that these actually get obfuscated,
+// however we should add regression tests 
 func byteTest() {
 	a := []byte{12, 13}
 	for _, elm := range a {
@@ -238,6 +253,9 @@ func byteTest() {
 		print(elm, ",")
 	}
 	println()
+
+	e := []byte{0x43, 11_1, 0b01101101, 'p', 'l', 'e', 'x'}
+	println(string(e))
 }
 
 func stringTypeFunc(s stringType) stringType {
@@ -330,3 +348,6 @@ foo
 12,13,
 12,13,
 12,13,0,0,
+Complex
+1: literal in an array
+2: literal in a slice
