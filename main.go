@@ -23,11 +23,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
-	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -76,10 +76,12 @@ Similarly, to combine garble flags and Go build flags:
 
 The following commands are supported:
 
-	build [packages]   replace "go build"
-	test [packages]    replace "go test"
-	version            print Garble version
-	reverse [files]    de-obfuscate output such as stack traces
+	build          replace "go build"
+	test           replace "go test"
+	version        print Garble version
+	reverse        de-obfuscate output such as stack traces
+
+To learn more about a command, run "garble help <command>".
 
 garble accepts the following flags before a command:
 
@@ -246,51 +248,17 @@ func (e errJustExit) Error() string { return fmt.Sprintf("exit: %d", e) }
 
 func goVersionOK() bool {
 	const (
-		minGoVersionSemver = "v1.16.0"
-		suggestedGoVersion = "1.16.x"
-
-		gitTimeFormat = "Mon Jan 2 15:04:05 2006 -0700"
+		minGoVersionSemver = "v1.17.0"
+		suggestedGoVersion = "1.17.x"
 	)
-	// Go 1.16 was released on Febuary 16th, 2021.
-	minGoVersionDate := time.Date(2021, 2, 16, 0, 0, 0, 0, time.UTC)
 
-	version := cache.GoEnv.GOVERSION
+	rxVersion := regexp.MustCompile(`go\d+\.\d+(\.\d)?`)
+	version := rxVersion.FindString(cache.GoEnv.GOVERSION)
 	if version == "" {
 		// Go 1.15.x and older do not have GOVERSION yet.
 		// We could go the extra mile and fetch it via 'go version',
 		// but we'd have to error anyway.
 		fmt.Fprintf(os.Stderr, "Go version is too old; please upgrade to Go %s or a newer devel version\n", suggestedGoVersion)
-		return false
-	}
-
-	if strings.HasPrefix(version, "devel ") {
-		commitAndDate := strings.TrimPrefix(version, "devel ")
-		// Remove commit hash and architecture from version
-		startDateIdx := strings.IndexByte(commitAndDate, ' ') + 1
-		if startDateIdx < 0 {
-			// Custom version; assume the user knows what they're doing.
-			// TODO: cover this in a test
-			return true
-		}
-
-		// TODO: once we support Go 1.17 and later, use the major Go
-		// version included in its devel versions:
-		//
-		//   go version devel go1.17-8518aac314 ...
-
-		date := commitAndDate[startDateIdx:]
-
-		versionDate, err := time.Parse(gitTimeFormat, date)
-		if err != nil {
-			// Custom version; assume the user knows what they're doing.
-			return true
-		}
-
-		if versionDate.After(minGoVersionDate) {
-			return true
-		}
-
-		fmt.Fprintf(os.Stderr, "Go version %q is too old; please upgrade to Go %s or a newer devel version\n", version, suggestedGoVersion)
 		return false
 	}
 
@@ -307,14 +275,19 @@ func mainErr(args []string) error {
 	// If we recognize an argument, we're not running within -toolexec.
 	switch command, args := args[0], args[1:]; command {
 	case "help":
-		if len(args) > 0 {
-			return fmt.Errorf("the help command does not take arguments")
+		if hasHelpFlag(args) || len(args) > 1 {
+			fmt.Fprintf(os.Stderr, "usage: garble help [command]\n")
+			return errJustExit(2)
+		}
+		if len(args) == 1 {
+			return mainErr([]string{args[0], "-h"})
 		}
 		usage()
 		return errJustExit(2)
 	case "version":
-		if len(args) > 0 {
-			return fmt.Errorf("the version command does not take arguments")
+		if hasHelpFlag(args) || len(args) > 0 {
+			fmt.Fprintf(os.Stderr, "usage: garble version\n")
+			return errJustExit(2)
 		}
 		// don't overwrite the version if it was set by -ldflags=-X
 		if info, ok := debug.ReadBuildInfo(); ok && version == "(devel)" {
@@ -361,23 +334,6 @@ func mainErr(args []string) error {
 	}
 
 	toolexecImportPath := os.Getenv("TOOLEXEC_IMPORTPATH")
-
-	// Workaround for https://github.com/golang/go/issues/44963.
-	// TODO(mvdan): remove once we only support Go 1.17 and later.
-	if tool == "compile" && !strings.Contains(toolexecImportPath, ".test]") {
-		isTestPkg := false
-		_, paths := splitFlagsFromFiles(args, ".go")
-		for _, path := range paths {
-			if strings.HasSuffix(path, "_test.go") {
-				isTestPkg = true
-				break
-			}
-		}
-		if isTestPkg {
-			forPkg := strings.TrimSuffix(toolexecImportPath, "_test")
-			toolexecImportPath = fmt.Sprintf("%s [%s.test]", toolexecImportPath, forPkg)
-		}
-	}
 
 	curPkg = cache.ListedPackages[toolexecImportPath]
 	if curPkg == nil {
@@ -658,22 +614,16 @@ func transformCompile(args []string) ([]string, error) {
 		return nil, err
 	}
 
-	if err = loadKnownReflectAPIs(curPkg); err != nil {
+	if err := loadKnownReflectAPIs(); err != nil {
 		return nil, err
 	}
 	tf.findReflectFunctions(files)
-	if err := saveKnownReflectAPIs(curPkg); err != nil {
+	if err := saveKnownReflectAPIs(); err != nil {
 		return nil, err
 	}
 
-	if (curPkg.ImportPath == "runtime" && opts.Tiny) || curPkg.ImportPath == "runtime/internal/sys" {
-		// Even though these packages aren't private, we will still process
-		// them later to remove build information and strip code from the
-		// runtime. However, we only want flags to work on private packages.
+	if runtimeAndDeps[curPkg.ImportPath] {
 		opts.GarbleLiterals = false
-		opts.DebugDir = ""
-	} else if !curPkg.Private {
-		return append(flags, paths...), nil
 	}
 
 	// Literal obfuscation uses math/rand, so seed it deterministically.
@@ -699,29 +649,9 @@ func transformCompile(args []string) ([]string, error) {
 
 	for i, file := range files {
 		name := filepath.Base(paths[i])
-		switch curPkg.ImportPath {
-		case "runtime":
+		if curPkg.ImportPath == "runtime" && opts.Tiny {
 			// strip unneeded runtime code
 			stripRuntime(name, file)
-		case "runtime/internal/sys":
-			// The first declaration in zversion.go contains the Go
-			// version as follows. Replace it here, since the
-			// linker's -X does not work with constants.
-			//
-			//     const TheVersion = `devel ...`
-			//
-			// Don't touch the source in any other way.
-			// TODO: remove once we only support Go 1.17 and later,
-			// as from that point we can just rely on linking -X flags.
-			if name != "zversion.go" {
-				break
-			}
-			spec := file.Decls[0].(*ast.GenDecl).Specs[0].(*ast.ValueSpec)
-			if len(spec.Names) != 1 || spec.Names[0].Name != "TheVersion" {
-				break
-			}
-			lit := spec.Values[0].(*ast.BasicLit)
-			lit.Value = "`unknown`"
 		}
 		if strings.HasPrefix(name, "_cgo_") {
 			// Don't obfuscate cgo code, since it's generated and it gets messy.
@@ -772,9 +702,6 @@ func transformCompile(args []string) ([]string, error) {
 // Right now, this means recording what local names are used with go:linkname,
 // and rewriting those directives to use obfuscated name from other packages.
 func (tf *transformer) handleDirectives(comments []*ast.CommentGroup) {
-	if !curPkg.Private {
-		return
-	}
 	for _, group := range comments {
 		for _, comment := range group.List {
 			if !strings.HasPrefix(comment.Text, "//go:linkname ") {
@@ -787,8 +714,10 @@ func (tf *transformer) handleDirectives(comments []*ast.CommentGroup) {
 			}
 			// This directive has two arguments: "go:linkname localName newName"
 
-			// obfuscate the local name.
-			fields[1] = hashWith(curPkg.GarbleActionID, fields[1])
+			// obfuscate the local name, if the current package is obfuscated
+			if curPkg.Private {
+				fields[1] = hashWith(curPkg.GarbleActionID, fields[1])
+			}
 
 			// If the new name is of the form "pkgpath.Name", and
 			// we've obfuscated "Name" in that package, rewrite the
@@ -835,86 +764,56 @@ func (tf *transformer) handleDirectives(comments []*ast.CommentGroup) {
 	}
 }
 
-// runtimeRelated is a snapshot of all the packages runtime depends on, or
+// cannotObfuscate is a list of some packages the runtime depends on, or
 // packages which the runtime points to via go:linkname.
 //
 // Once we support go:linkname well and once we can obfuscate the runtime
 // package, this entire map can likely go away.
 //
-// The list was obtained via scripts/runtime-related.sh on Go 1.16.
-var runtimeRelated = map[string]bool{
-	"bufio":                                  true,
-	"bytes":                                  true,
-	"compress/flate":                         true,
-	"compress/gzip":                          true,
-	"context":                                true,
-	"crypto/x509/internal/macos":             true,
-	"encoding/binary":                        true,
-	"errors":                                 true,
-	"fmt":                                    true,
-	"hash":                                   true,
-	"hash/crc32":                             true,
-	"internal/bytealg":                       true,
-	"internal/cpu":                           true,
-	"internal/fmtsort":                       true,
-	"internal/nettrace":                      true,
-	"internal/oserror":                       true,
-	"internal/poll":                          true,
-	"internal/race":                          true,
-	"internal/reflectlite":                   true,
-	"internal/singleflight":                  true,
-	"internal/syscall/execenv":               true,
-	"internal/syscall/unix":                  true,
-	"internal/syscall/windows":               true,
-	"internal/syscall/windows/registry":      true,
-	"internal/syscall/windows/sysdll":        true,
-	"internal/testlog":                       true,
-	"internal/unsafeheader":                  true,
-	"io":                                     true,
-	"io/fs":                                  true,
-	"math":                                   true,
-	"math/bits":                              true,
-	"net":                                    true,
-	"os":                                     true,
-	"os/signal":                              true,
-	"path":                                   true,
-	"plugin":                                 true,
-	"reflect":                                true,
-	"runtime":                                true,
-	"runtime/cgo":                            true,
-	"runtime/debug":                          true,
-	"runtime/internal/atomic":                true,
-	"runtime/internal/math":                  true,
-	"runtime/internal/sys":                   true,
-	"runtime/metrics":                        true,
-	"runtime/pprof":                          true,
-	"runtime/trace":                          true,
-	"sort":                                   true,
-	"strconv":                                true,
-	"strings":                                true,
-	"sync":                                   true,
-	"sync/atomic":                            true,
-	"syscall":                                true,
-	"text/tabwriter":                         true,
-	"time":                                   true,
-	"unicode":                                true,
-	"unicode/utf16":                          true,
-	"unicode/utf8":                           true,
-	"unsafe":                                 true,
-	"vendor/golang.org/x/net/dns/dnsmessage": true,
-	"vendor/golang.org/x/net/route":          true,
+// TODO: investigate and resolve each one of these
+var cannotObfuscate = map[string]bool{
+	// not a "real" package
+	"unsafe": true,
 
-	// Manual additions for Go 1.17 as of June 2021.
-	"internal/abi":          true,
-	"internal/itoa":         true,
-	"internal/goexperiment": true,
+	// some linkname failure
+	"time":          true,
+	"runtime/pprof": true,
+
+	// all kinds of stuff breaks when obfuscating the runtime
+	"syscall":      true,
+	"internal/abi": true,
+
+	// rebuilds don't work
+	"os/signal": true,
+
+	// cgo breaks otherwise
+	"runtime/cgo": true,
+
+	// garble reverse breaks otherwise
+	"runtime/debug": true,
+
+	// cgo heavy net doesn't like to be obfuscated
+	"net": true,
+
+	// some linkname failure
+	"crypto/x509/internal/macos": true,
+}
+
+// We can't obfuscate literals in the runtime and its dependencies,
+// because obfuscated literals sometimes escape to heap,
+// and that's not allowed in the runtime itself.
+var runtimeAndDeps = map[string]bool{
+	"runtime":                 true,
+	"runtime/internal/sys":    true,
+	"internal/cpu":            true,
+	"runtime/internal/atomic": true,
 }
 
 // isPrivate checks if a package import path should be considered private,
 // meaning that it should be obfuscated.
 func isPrivate(path string) bool {
 	// We don't support obfuscating these yet.
-	if runtimeRelated[path] {
+	if cannotObfuscate[path] || runtimeAndDeps[path] {
 		return false
 	}
 	// These are main packages, so we must always obfuscate them.
@@ -1023,8 +922,10 @@ func processImportCfg(flags []string) (newImportCfg string, _ error) {
 	return newCfg.Name(), nil
 }
 
-type funcFullName = string
-type reflectParameterPosition = int
+type (
+	funcFullName             = string
+	reflectParameterPosition = int
+)
 
 // knownReflectAPIs is a static record of what std APIs use reflection on their
 // parameters, so we can avoid obfuscating types used with them.
@@ -1036,16 +937,37 @@ var knownReflectAPIs = map[funcFullName][]reflectParameterPosition{
 	"reflect.ValueOf": {0},
 }
 
-func loadKnownReflectAPIs(currPkg *listedPackage) error {
-	for path := range importCfgEntries {
+// garbleExportFile returns an absolute path to a build cache entry
+// which belongs to garble and corresponds to the given Go package.
+//
+// Unlike pkg.Export, it is only read and written by garble itself.
+// Also unlike pkg.Export, it includes GarbleActionID,
+// so its path will change if the obfuscated build changes.
+//
+// The purpose of such a file is to store garble-specific information
+// in the build cache, to be reused at a later time.
+// The file should have the same lifetime as pkg.Export,
+// as it lives under the same cache directory that gets trimmed automatically.
+func garbleExportFile(pkg *listedPackage) string {
+	trimmed := strings.TrimSuffix(pkg.Export, "-d")
+	if trimmed == pkg.Export {
+		panic(fmt.Sprintf("unexpected export path of %s: %q", pkg.ImportPath, pkg.Export))
+	}
+	return trimmed + "-garble-" + hashToString(pkg.GarbleActionID) + "-d"
+}
+
+func loadKnownReflectAPIs() error {
+	for _, path := range curPkg.Deps {
 		pkg, err := listPackage(path)
 		if err != nil {
 			return err
 		}
-
+		if pkg.Export == "" {
+			continue // nothing to load
+		}
 		// this function literal is used for the deferred close
 		err = func() error {
-			filename := strings.TrimSuffix(pkg.Export, "-d") + "-garble-d"
+			filename := garbleExportFile(pkg)
 			f, err := os.Open(filename)
 			if err != nil {
 				return err
@@ -1053,7 +975,10 @@ func loadKnownReflectAPIs(currPkg *listedPackage) error {
 			defer f.Close()
 
 			// Decode appends new entries to the existing map
-			return gob.NewDecoder(f).Decode(&knownReflectAPIs)
+			if err := gob.NewDecoder(f).Decode(&knownReflectAPIs); err != nil {
+				return fmt.Errorf("gob decode: %w", err)
+			}
+			return nil
 		}()
 		if err != nil {
 			return err
@@ -1063,15 +988,18 @@ func loadKnownReflectAPIs(currPkg *listedPackage) error {
 	return nil
 }
 
-func saveKnownReflectAPIs(currPkg *listedPackage) error {
-	filename := strings.TrimSuffix(currPkg.Export, "-d") + "-garble-d"
+func saveKnownReflectAPIs() error {
+	filename := garbleExportFile(curPkg)
 	f, err := os.Create(filename)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	return gob.NewEncoder(f).Encode(knownReflectAPIs)
+	if err := gob.NewEncoder(f).Encode(knownReflectAPIs); err != nil {
+		return fmt.Errorf("gob encode: %w", err)
+	}
+	return f.Close()
 }
 
 func (tf *transformer) findReflectFunctions(files []*ast.File) {
@@ -1755,7 +1683,7 @@ func alterTrimpath(flags []string) []string {
 	return flagSetValue(flags, "-trimpath", sharedTempDir+"=>;"+trimpath)
 }
 
-// buildFlags is obtained from 'go help build' as of Go 1.16.
+// buildFlags is obtained from 'go help build' as of Go 1.17.
 var buildFlags = map[string]bool{
 	"-a":             true,
 	"-n":             true,
@@ -1783,7 +1711,7 @@ var buildFlags = map[string]bool{
 	"-overlay":       true,
 }
 
-// booleanFlags is obtained from 'go help build' and 'go help testflag' as of Go 1.16.
+// booleanFlags is obtained from 'go help build' and 'go help testflag' as of Go 1.17.
 var booleanFlags = map[string]bool{
 	// Shared build flags.
 	"-a":          true,
