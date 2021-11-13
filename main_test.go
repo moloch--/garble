@@ -16,7 +16,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/rogpeppe/go-internal/goproxytest"
@@ -92,6 +91,7 @@ func TestScripts(t *testing.T) {
 			"binsubstr":         binsubstr,
 			"bincmp":            bincmp,
 			"generate-literals": generateLiterals,
+			"setenvfile":        setenvfile,
 		},
 		UpdateScripts: *update,
 	}
@@ -99,31 +99,6 @@ func TestScripts(t *testing.T) {
 		t.Fatal(err)
 	}
 	testscript.Run(t, p)
-}
-
-type binaryCache struct {
-	name    string
-	modtime time.Time
-	content string
-}
-
-var cachedBinary binaryCache
-
-func readFile(ts *testscript.TestScript, file string) string {
-	file = ts.MkAbs(file)
-	info, err := os.Stat(file)
-	if err != nil {
-		ts.Fatalf("%v", err)
-	}
-
-	if cachedBinary.modtime == info.ModTime() && cachedBinary.name == file {
-		return cachedBinary.content
-	}
-
-	cachedBinary.name = file
-	cachedBinary.modtime = info.ModTime()
-	cachedBinary.content = ts.ReadFile(file)
-	return cachedBinary.content
 }
 
 func createFile(ts *testscript.TestScript, path string) *os.File {
@@ -138,7 +113,7 @@ func binsubstr(ts *testscript.TestScript, neg bool, args []string) {
 	if len(args) < 2 {
 		ts.Fatalf("usage: binsubstr file substr...")
 	}
-	data := readFile(ts, args[0])
+	data := ts.ReadFile(args[0])
 	var failed []string
 	for _, substr := range args[1:] {
 		match := strings.Contains(data, substr)
@@ -172,7 +147,10 @@ func bincmp(ts *testscript.TestScript, neg bool, args []string) {
 			ts.Logf("diffoscope is not installing; skipping binary diff")
 		} else {
 			// We'll error below; ignore the exec error here.
-			ts.Exec("diffoscope", ts.MkAbs(args[0]), ts.MkAbs(args[1]))
+			ts.Exec("diffoscope",
+				"--diff-context", "2", // down from 7 by default
+				"--max-text-report-size", "4096", // no limit (in bytes) by default; avoid huge output
+				ts.MkAbs(args[0]), ts.MkAbs(args[1]))
 		}
 		sizeDiff := len(data2) - len(data1)
 		ts.Fatalf("%s and %s differ; diffoscope above, size diff: %+d",
@@ -237,6 +215,17 @@ func generateLiterals(ts *testscript.TestScript, neg bool, args []string) {
 	if err := printer.Fprint(codeFile, token.NewFileSet(), file); err != nil {
 		ts.Fatalf("%v", err)
 	}
+}
+
+func setenvfile(ts *testscript.TestScript, neg bool, args []string) {
+	if neg {
+		ts.Fatalf("unsupported: ! setenvfile")
+	}
+	if len(args) != 2 {
+		ts.Fatalf("usage: setenvfile name file")
+	}
+
+	ts.Setenv(args[0], ts.ReadFile(args[1]))
 }
 
 func TestSplitFlagsFromArgs(t *testing.T) {

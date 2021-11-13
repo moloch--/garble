@@ -13,8 +13,8 @@ jobs:
     strategy:
       matrix:
         go-version: [1.17.x]
-        platform: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.platform }}
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
     - name: Install Go
       uses: actions/setup-go@v2
@@ -25,15 +25,21 @@ jobs:
     - name: Test
       run: |
         go version
-        go test -timeout 1h ./...
+        go test ./...
+    - name: Test with -race
+      # macos and windows tend to be a bit slower,
+      # and it's rare that a race in garble would be OS-specific.
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        go test -race ./...
 
   test-gotip:
     runs-on: ubuntu-latest
-    continue-on-error: true # master breaks sometimes
+    continue-on-error: true # master may not be as stable
     steps:
     - name: Install Go
       env:
-        GO_COMMIT: 46fd547d899286982971474b329d7a95da4f2a6b # 2021-08-11
+        GO_COMMIT: 578ada410de8065dbca46bca08a5993d1307f423 # 2021-11-09
       run: |
         cd $HOME
         mkdir $HOME/gotip
