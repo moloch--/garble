@@ -48,15 +48,17 @@ var (
 )
 
 var (
-	flagObfuscateLiterals bool
-	flagGarbleTiny        bool
-	flagDebugDir          string
-	flagSeed              string
+	flagObfuscateLiterals   bool
+	flagGarbleTiny          bool
+	flagDebugDir            string
+	flagSeed                string
+	flagLiteralMaxSizeBytes int
 )
 
 func init() {
 	flagSet.Usage = usage
 	flagSet.BoolVar(&flagObfuscateLiterals, "literals", false, "Obfuscate literals such as strings")
+	flagSet.IntVar(&flagLiteralMaxSizeBytes, "literals-max-size", 32*1024, "Max size of literals to obfuscate (WARNING: May cause significant memory usage)")
 	flagSet.BoolVar(&flagGarbleTiny, "tiny", false, "Optimize for binary size, losing some ability to reverse the process")
 	flagSet.StringVar(&flagDebugDir, "debugdir", "", "Write the obfuscated source to a directory, e.g. -debugdir=out")
 	flagSet.StringVar(&flagSeed, "seed", "", "Provide a base64-encoded seed, e.g. -seed=o9WDTZ4CN4w\nFor a random seed, provide -seed=random")
@@ -1265,7 +1267,7 @@ func (tf *transformer) recordType(t types.Type) {
 // transformGo obfuscates the provided Go syntax file.
 func (tf *transformer) transformGo(file *ast.File) *ast.File {
 	if opts.ObfuscateLiterals {
-		file = literals.Obfuscate(file, tf.info, fset, tf.ignoreObjects)
+		file = literals.Obfuscate(file, tf.info, fset, opts.LiteralMaxSizeBytes, tf.ignoreObjects)
 	}
 
 	pre := func(cursor *astutil.Cursor) bool {

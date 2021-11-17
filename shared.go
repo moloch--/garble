@@ -119,11 +119,12 @@ func writeGobExclusive(name string, val interface{}) error {
 
 // flagOptions are derived from the flags
 type flagOptions struct {
-	ObfuscateLiterals bool
-	Tiny              bool
-	GarbleDir         string
-	DebugDir          string
-	Seed              []byte
+	ObfuscateLiterals   bool
+	LiteralMaxSizeBytes int
+	Tiny                bool
+	GarbleDir           string
+	DebugDir            string
+	Seed                []byte
 }
 
 // setFlagOptions sets flagOptions from the user supplied flags.
@@ -137,9 +138,10 @@ func setFlagOptions() error {
 		panic("opts set twice?")
 	}
 	opts = &flagOptions{
-		GarbleDir:         wd,
-		ObfuscateLiterals: flagObfuscateLiterals,
-		Tiny:              flagGarbleTiny,
+		GarbleDir:           wd,
+		ObfuscateLiterals:   flagObfuscateLiterals,
+		LiteralMaxSizeBytes: flagLiteralMaxSizeBytes,
+		Tiny:                flagGarbleTiny,
 	}
 
 	if flagSeed == "random" {
