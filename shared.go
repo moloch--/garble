@@ -127,6 +127,75 @@ func writeGobExclusive(name string, val interface{}) error {
 	return err
 }
 
+// flagOptions are derived from the flags
+type flagOptions struct {
+	ObfuscateLiterals   bool
+	LiteralMaxSizeBytes int
+	Tiny                bool
+	GarbleDir           string
+	DebugDir            string
+	Seed                []byte
+}
+
+// setFlagOptions sets flagOptions from the user supplied flags.
+func setFlagOptions() error {
+	wd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+
+	if cache != nil {
+		panic("opts set twice?")
+	}
+	opts = &flagOptions{
+		GarbleDir:           wd,
+		ObfuscateLiterals:   flagObfuscateLiterals,
+		LiteralMaxSizeBytes: flagLiteralMaxSizeBytes,
+		Tiny:                flagGarbleTiny,
+	}
+
+	if flagSeed == "random" {
+		opts.Seed = make([]byte, 16) // random 128 bit seed
+		if _, err := rand.Read(opts.Seed); err != nil {
+			return fmt.Errorf("error generating random seed: %v", err)
+		}
+
+	} else if len(flagSeed) > 0 {
+		// We expect unpadded base64, but to be nice, accept padded
+		// strings too.
+		flagSeed = strings.TrimRight(flagSeed, "=")
+		seed, err := base64.RawStdEncoding.DecodeString(flagSeed)
+		if err != nil {
+			return fmt.Errorf("error decoding seed: %v", err)
+		}
+
+		if len(seed) < 8 {
+			return fmt.Errorf("-seed needs at least 8 bytes, have %d", len(seed))
+		}
+
+		opts.Seed = seed
+	}
+
+	if flagDebugDir != "" {
+		if !filepath.IsAbs(flagDebugDir) {
+			flagDebugDir = filepath.Join(wd, flagDebugDir)
+		}
+
+		if err := os.RemoveAll(flagDebugDir); err == nil || errors.Is(err, fs.ErrExist) {
+			err := os.MkdirAll(flagDebugDir, 0o755)
+			if err != nil {
+				return err
+			}
+		} else {
+			return fmt.Errorf("debugdir error: %v", err)
+		}
+
+		opts.DebugDir = flagDebugDir
+	}
+
+	return nil
+}
+
 // listedPackage contains the 'go list -json -export' fields obtained by the
 // root process, shared with all garble sub-processes via a file.
 type listedPackage struct {
