@@ -26,7 +26,7 @@ import (
 // If someone truly wants to obfuscate those, they should do that when they
 // generate the code, not at build time. Plus, with Go 1.16 that technique
 // should largely stop being used.
-const maxSizeBytes = int(64 * 1024) // 128Kb
+// const maxSizeBytes = int(64 * 1024) // 128Kb
 
 func randObfuscator() obfuscator {
 	randPos := mathrand.Intn(len(obfuscators))
@@ -34,7 +34,7 @@ func randObfuscator() obfuscator {
 }
 
 // Obfuscate replaces literals with obfuscated anonymous functions.
-func Obfuscate(file *ast.File, info *types.Info, fset *token.FileSet, linkStrings map[types.Object]string) *ast.File {
+func Obfuscate(file *ast.File, info *types.Info, fset *token.FileSet, maxSizeBytes int, ignoreObj map[types.Object]bool) *ast.File {
 	pre := func(cursor *astutil.Cursor) bool {
 		switch node := cursor.Node().(type) {
 		case *ast.GenDecl:
