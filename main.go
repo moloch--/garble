@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -17,6 +18,7 @@ import (
 	"go/token"
 	"go/types"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"log"
 	mathrand "math/rand"
@@ -170,7 +172,7 @@ func obfuscatedTypesPackage(path string) *types.Package {
 			"-trimpath",
 			"-toolexec=" + cache.ExecPath,
 		}
-		goArgs = append(goArgs, cache.BuildFlags...)
+		goArgs = append(goArgs, cache.ForwardBuildFlags...)
 		goArgs = append(goArgs, path)
 
 		cmd := exec.Command("go", goArgs...)
@@ -192,7 +194,7 @@ func obfuscatedTypesPackage(path string) *types.Package {
 		entry = &importCfgEntry{
 			packagefile: pkg.Export,
 		}
-		// Adding it to buildInfo.imports allows us to reuse the
+		// Adding it to importCfgEntries allows us to reuse the
 		// "if" branch below. Plus, if this edge case triggers
 		// multiple times in a single package compile, we can
 		// call "go list" once and cache its result.
@@ -349,6 +351,7 @@ func mainErr(args []string) error {
 			return err
 		}
 	}
+	// log.Println(tool, transformed)
 	cmd := exec.Command(args[0], transformed...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -398,9 +401,9 @@ This command wraps "go %s". Below is its help:
 
 	// Note that we also need to pass build flags to 'go list', such
 	// as -tags.
-	cache.BuildFlags, _ = filterBuildFlags(flags)
+	cache.ForwardBuildFlags, _ = filterForwardBuildFlags(flags)
 	if command == "test" {
-		cache.BuildFlags = append(cache.BuildFlags, "-test")
+		cache.ForwardBuildFlags = append(cache.ForwardBuildFlags, "-test")
 	}
 
 	if err := fetchGoEnv(); err != nil {
@@ -472,6 +475,28 @@ func transformAsm(args []string) ([]string, error) {
 
 	flags = alterTrimpath(flags)
 
+	// If the assembler is running just for -gensymabis,
+	// don't obfuscate the source, as we are not assembling yet.
+	// The assembler will run again later; obfuscating twice is just wasteful.
+	symabis := false
+	for _, arg := range args {
+		if arg == "-gensymabis" {
+			symabis = true
+			break
+		}
+	}
+	newPaths := make([]string, 0, len(paths))
+	if !symabis {
+		var newPaths []string
+		for _, path := range paths {
+			name := filepath.Base(path)
+			pkgDir := filepath.Join(sharedTempDir, filepath.FromSlash(curPkg.ImportPath))
+			newPath := filepath.Join(pkgDir, name)
+			newPaths = append(newPaths, newPath)
+		}
+		return append(flags, newPaths...), nil
+	}
+
 	// We need to replace all function references with their obfuscated name
 	// counterparts.
 	// Luckily, all func names in Go assembly files are immediately followed
@@ -481,7 +506,6 @@ func transformAsm(args []string) ([]string, error) {
 	const middleDot = '·'
 	middleDotLen := utf8.RuneLen(middleDot)
 
-	newPaths := make([]string, 0, len(paths))
 	for _, path := range paths {
 
 		// Read the entire file into memory.
@@ -572,7 +596,7 @@ func writeTemp(name string, content []byte) (string, error) {
 		return "", err
 	}
 	dstPath := filepath.Join(pkgDir, name)
-	if err := os.WriteFile(dstPath, content, 0o666); err != nil {
+	if err := writeFileExclusive(dstPath, content); err != nil {
 		return "", err
 	}
 	return dstPath, nil
@@ -614,11 +638,17 @@ func transformCompile(args []string) ([]string, error) {
 		return nil, err
 	}
 
+	// Note that if the file already exists in the cache from another build,
+	// we don't need to write to it again thanks to the hash.
+	// TODO: as an optimization, just load that one gob file.
 	if err := loadKnownReflectAPIs(); err != nil {
 		return nil, err
 	}
 	tf.findReflectFunctions(files)
-	if err := saveKnownReflectAPIs(); err != nil {
+	if err := writeGobExclusive(
+		garbleExportFile(curPkg),
+		knownReflectAPIs,
+	); err != nil && !errors.Is(err, fs.ErrExist) {
 		return nil, err
 	}
 
@@ -838,6 +868,7 @@ func processImportCfg(flags []string) (newImportCfg string, _ error) {
 		return "", err
 	}
 
+	// TODO: use slices rather than maps to generate a deterministic importcfg.
 	importCfgEntries = make(map[string]*importCfgEntry)
 	importMap := make(map[string]string)
 
@@ -859,7 +890,7 @@ func processImportCfg(flags []string) (newImportCfg string, _ error) {
 				continue
 			}
 			beforePath, afterPath := args[:j], args[j+1:]
-			importMap[afterPath] = beforePath
+			importMap[beforePath] = afterPath
 		case "packagefile":
 			args := strings.TrimSpace(line[i+1:])
 			j := strings.Index(args, "=")
@@ -870,10 +901,6 @@ func processImportCfg(flags []string) (newImportCfg string, _ error) {
 
 			impPkg := &importCfgEntry{packagefile: objectPath}
 			importCfgEntries[importPath] = impPkg
-
-			if otherPath, ok := importMap[importPath]; ok {
-				importCfgEntries[otherPath] = impPkg
-			}
 		}
 	}
 	// log.Printf("%#v", buildInfo)
@@ -988,20 +1015,6 @@ func loadKnownReflectAPIs() error {
 	}
 
 	return nil
-}
-
-func saveKnownReflectAPIs() error {
-	filename := garbleExportFile(curPkg)
-	f, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	if err := gob.NewEncoder(f).Encode(knownReflectAPIs); err != nil {
-		return fmt.Errorf("gob encode: %w", err)
-	}
-	return f.Close()
 }
 
 func (tf *transformer) findReflectFunctions(files []*ast.File) {
@@ -1268,11 +1281,28 @@ func (tf *transformer) transformGo(file *ast.File) *ast.File {
 		}
 		obj := tf.info.ObjectOf(node)
 		if obj == nil {
-			return true
+			_, isImplicit := tf.info.Defs[node]
+			_, parentIsFile := cursor.Parent().(*ast.File)
+			if isImplicit && !parentIsFile {
+				// In a type switch like "switch foo := bar.(type) {",
+				// "foo" is being declared as a symbolic variable,
+				// as it is only actually declared in each "case SomeType:".
+				//
+				// As such, the symbolic "foo" in the syntax tree has no object,
+				// but it is still recorded under Defs with a nil value.
+				// We still want to obfuscate that syntax tree identifier,
+				// so if we detect the case, create a dummy types.Var for it.
+				//
+				// Note that "package mypkg" also denotes a nil object in Defs,
+				// and we don't want to treat that "mypkg" as a variable,
+				// so avoid that case by checking the type of cursor.Parent.
+				obj = types.NewVar(node.Pos(), tf.pkg, node.Name, nil)
+			} else {
+				return true
+			}
 		}
 		pkg := obj.Pkg()
 		if vr, ok := obj.(*types.Var); ok && vr.Embedded() {
-
 			// The docs for ObjectOf say:
 			//
 			//     If id is an embedded struct field, ObjectOf returns the
@@ -1349,16 +1379,10 @@ func (tf *transformer) transformGo(file *ast.File) *ast.File {
 		hashToUse := lpkg.GarbleActionID
 
 		// log.Printf("%s: %#v %T", fset.Position(node.Pos()), node, obj)
-		parentScope := obj.Parent()
 		switch obj := obj.(type) {
 		case *types.Var:
-			if parentScope != nil && parentScope != pkg.Scope() {
-				// Identifiers of non-global variables never show up in the binary.
-				return true
-			}
-
 			if !obj.IsField() {
-				// Identifiers of global variables are always obfuscated.
+				// Identifiers denoting variables are always obfuscated.
 				break
 			}
 			// From this point on, we deal with struct fields.
@@ -1408,11 +1432,6 @@ func (tf *transformer) transformGo(file *ast.File) *ast.File {
 				}
 			}
 		case *types.TypeName:
-			if parentScope != pkg.Scope() {
-				// Identifiers of non-global types never show up in the binary.
-				return true
-			}
-
 			// If the type was not obfuscated in the package were it was defined,
 			// do not obfuscate it here.
 			if path != curPkg.ImportPath {
@@ -1685,16 +1704,22 @@ func alterTrimpath(flags []string) []string {
 	return flagSetValue(flags, "-trimpath", sharedTempDir+"=>;"+trimpath)
 }
 
-// buildFlags is obtained from 'go help build' as of Go 1.17.
-var buildFlags = map[string]bool{
-	"-a":             true,
-	"-n":             true,
+// forwardBuildFlags is obtained from 'go help build' as of Go 1.17.
+var forwardBuildFlags = map[string]bool{
+	// These shouldn't be used in nested cmd/go calls.
+	"-a": false,
+	"-n": false,
+	"-x": false,
+	"-v": false,
+
+	// These are always set by garble.
+	"-trimpath": false,
+	"-toolexec": false,
+
 	"-p":             true,
 	"-race":          true,
 	"-msan":          true,
-	"-v":             true,
 	"-work":          true,
-	"-x":             true,
 	"-asmflags":      true,
 	"-buildmode":     true,
 	"-compiler":      true,
@@ -1708,8 +1733,6 @@ var buildFlags = map[string]bool{
 	"-modfile":       true,
 	"-pkgdir":        true,
 	"-tags":          true,
-	"-trimpath":      true,
-	"-toolexec":      true,
 	"-overlay":       true,
 }
 
@@ -1736,7 +1759,7 @@ var booleanFlags = map[string]bool{
 	"-benchmem": true,
 }
 
-func filterBuildFlags(flags []string) (filtered []string, firstUnknown string) {
+func filterForwardBuildFlags(flags []string) (filtered []string, firstUnknown string) {
 	for i := 0; i < len(flags); i++ {
 		arg := flags[i]
 		name := arg
@@ -1744,7 +1767,7 @@ func filterBuildFlags(flags []string) (filtered []string, firstUnknown string) {
 			name = arg[:i]
 		}
 
-		buildFlag := buildFlags[name]
+		buildFlag := forwardBuildFlags[name]
 		if buildFlag {
 			filtered = append(filtered, arg)
 		} else {
