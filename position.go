@@ -30,8 +30,8 @@ func printFile(file1 *ast.File) ([]byte, error) {
 	}
 	src := buf1.Bytes()
 
-	if !curPkg.Private {
-		// TODO(mvdan): make transformCompile handle non-private
+	if !curPkg.ToObfuscate {
+		// TODO(mvdan): make transformCompile handle untouched
 		// packages like runtime earlier on, to remove these checks.
 		return src, nil
 	}
@@ -103,7 +103,7 @@ func printFile(file1 *ast.File) ([]byte, error) {
 		origNode := origCallExprs[i]
 		i++
 		newName := ""
-		if !opts.Tiny {
+		if !flagTiny {
 			origPos := fmt.Sprintf("%s:%d", filename, fset.Position(origNode.Pos()).Offset)
 			newName = hashWith(curPkg.GarbleActionID, origPos) + ".go"
 			// log.Printf("%q hashed with %x to %q", origPos, curPkg.GarbleActionID, newName)

@@ -2,17 +2,16 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/gob"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"golang.org/x/mod/module"
 )
 
 // sharedCache is shared as a read-only cache between the many garble toolexec
@@ -24,8 +23,6 @@ import (
 type sharedCache struct {
 	ExecPath          string   // absolute path to the garble binary being used
 	ForwardBuildFlags []string // build flags fed to the original "garble ..." command
-
-	Options flagOptions // garble options being used, i.e. our own flags
 
 	// ListedPackages contains data obtained via 'go list -json -export -deps'.
 	// This allows us to obtain the non-obfuscated export data of all dependencies,
@@ -40,11 +37,14 @@ type sharedCache struct {
 	// we can likely just use that.
 	BinaryContentID []byte
 
+	GOGARBLE string
+
 	// From "go env", primarily.
 	GoEnv struct {
-		GOPRIVATE string // Set to the module path as a fallback.
+		GOPRIVATE string
 		GOMOD     string
 		GOVERSION string
+		GOCACHE   string
 	}
 }
 
@@ -55,10 +55,14 @@ func loadSharedCache() error {
 	if cache != nil {
 		panic("shared cache loaded twice?")
 	}
+	startTime := time.Now()
 	f, err := os.Open(filepath.Join(sharedTempDir, "main-cache.gob"))
 	if err != nil {
 		return fmt.Errorf(`cannot open shared file, this is most likely due to not running "garble [command]"`)
 	}
+	defer func() {
+		debugf("shared cache loaded in %s from %s", debugSince(startTime), f.Name())
+	}()
 	defer f.Close()
 	if err := gob.NewDecoder(f).Decode(&cache); err != nil {
 		return err
@@ -117,75 +121,6 @@ func writeGobExclusive(name string, val interface{}) error {
 	return err
 }
 
-// flagOptions are derived from the flags
-type flagOptions struct {
-	ObfuscateLiterals   bool
-	LiteralMaxSizeBytes int
-	Tiny                bool
-	GarbleDir           string
-	DebugDir            string
-	Seed                []byte
-}
-
-// setFlagOptions sets flagOptions from the user supplied flags.
-func setFlagOptions() error {
-	wd, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-
-	if cache != nil {
-		panic("opts set twice?")
-	}
-	opts = &flagOptions{
-		GarbleDir:           wd,
-		ObfuscateLiterals:   flagObfuscateLiterals,
-		LiteralMaxSizeBytes: flagLiteralMaxSizeBytes,
-		Tiny:                flagGarbleTiny,
-	}
-
-	if flagSeed == "random" {
-		opts.Seed = make([]byte, 16) // random 128 bit seed
-		if _, err := rand.Read(opts.Seed); err != nil {
-			return fmt.Errorf("error generating random seed: %v", err)
-		}
-
-	} else if len(flagSeed) > 0 {
-		// We expect unpadded base64, but to be nice, accept padded
-		// strings too.
-		flagSeed = strings.TrimRight(flagSeed, "=")
-		seed, err := base64.RawStdEncoding.DecodeString(flagSeed)
-		if err != nil {
-			return fmt.Errorf("error decoding seed: %v", err)
-		}
-
-		if len(seed) < 8 {
-			return fmt.Errorf("-seed needs at least 8 bytes, have %d", len(seed))
-		}
-
-		opts.Seed = seed
-	}
-
-	if flagDebugDir != "" {
-		if !filepath.IsAbs(flagDebugDir) {
-			flagDebugDir = filepath.Join(wd, flagDebugDir)
-		}
-
-		if err := os.RemoveAll(flagDebugDir); err == nil || errors.Is(err, fs.ErrExist) {
-			err := os.MkdirAll(flagDebugDir, 0o755)
-			if err != nil {
-				return err
-			}
-		} else {
-			return fmt.Errorf("debugdir error: %v", err)
-		}
-
-		opts.DebugDir = flagDebugDir
-	}
-
-	return nil
-}
-
 // listedPackage contains the 'go list -json -export' fields obtained by the
 // root process, shared with all garble sub-processes via a file.
 type listedPackage struct {
@@ -208,25 +143,33 @@ type listedPackage struct {
 
 	GarbleActionID []byte
 
-	Private bool
+	ToObfuscate bool
 }
 
 func (p *listedPackage) obfuscatedImportPath() string {
-	if p.Name == "main" || p.ImportPath == "embed" || !p.Private {
+	if p.Name == "main" || p.ImportPath == "embed" || !p.ToObfuscate {
 		return p.ImportPath
 	}
 	newPath := hashWith(p.GarbleActionID, p.ImportPath)
-	// log.Printf("%q hashed with %x to %q", p.ImportPath, p.GarbleActionID, newPath)
+	debugf("import path %q hashed with %x to %q", p.ImportPath, p.GarbleActionID, newPath)
 	return newPath
 }
 
-// setListedPackages gets information about the current package
+// appendListedPackages gets information about the current package
 // and all of its dependencies
-func setListedPackages(patterns []string) error {
+func appendListedPackages(patterns ...string) error {
+	startTime := time.Now()
+	// TODO: perhaps include all top-level build flags set by garble,
+	// including -buildinfo=false and -buildvcs=false.
+	// They shouldn't affect "go list" here, but might as well be consistent.
 	args := []string{"list", "-json", "-deps", "-export", "-trimpath"}
 	args = append(args, cache.ForwardBuildFlags...)
 	args = append(args, patterns...)
 	cmd := exec.Command("go", args...)
+
+	defer func() {
+		debugf("original build info obtained in %s via: go %s", debugSince(startTime), strings.Join(args, " "))
+	}()
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -240,14 +183,10 @@ func setListedPackages(patterns []string) error {
 		return fmt.Errorf("go list error: %v", err)
 	}
 
-	binaryBuildID, err := buildidOf(cache.ExecPath)
-	if err != nil {
-		return err
-	}
-	cache.BinaryContentID = decodeHash(splitContentID(binaryBuildID))
-
 	dec := json.NewDecoder(stdout)
-	cache.ListedPackages = make(map[string]*listedPackage)
+	if cache.ListedPackages == nil {
+		cache.ListedPackages = make(map[string]*listedPackage)
+	}
 	for dec.More() {
 		var pkg listedPackage
 		if err := dec.Decode(&pkg); err != nil {
@@ -264,21 +203,23 @@ func setListedPackages(patterns []string) error {
 		return fmt.Errorf("go list error: %v: %s", err, stderr.Bytes())
 	}
 
-	anyPrivate := false
+	anyToObfuscate := false
 	for path, pkg := range cache.ListedPackages {
-		// If "GOPRIVATE=foo/bar", "foo/bar_test" is also private.
+		// If "GOGARBLE=foo/bar", "foo/bar_test" should also match.
 		if pkg.ForTest != "" {
 			path = pkg.ForTest
 		}
-		// Test main packages like "foo/bar.test" are always private.
-		if (pkg.Name == "main" && strings.HasSuffix(path, ".test")) || isPrivate(path) {
-			pkg.Private = true
-			anyPrivate = true
+		// Test main packages like "foo/bar.test" are always obfuscated,
+		// just like main packages.
+		if (pkg.Name == "main" && strings.HasSuffix(path, ".test")) || toObfuscate(path) {
+			pkg.ToObfuscate = true
+			anyToObfuscate = true
 		}
 	}
 
-	if !anyPrivate {
-		return fmt.Errorf("GOPRIVATE=%q does not match any packages to be built", os.Getenv("GOPRIVATE"))
+	// Don't error if the user ran: GOGARBLE='*' garble build runtime
+	if !anyToObfuscate && !module.MatchPrefixPatterns(cache.GOGARBLE, "runtime") {
+		return fmt.Errorf("GOGARBLE=%q does not match any packages to be built", cache.GOGARBLE)
 	}
 
 	return nil
@@ -286,6 +227,10 @@ func setListedPackages(patterns []string) error {
 
 // listPackage gets the listedPackage information for a certain package
 func listPackage(path string) (*listedPackage, error) {
+	if path == curPkg.ImportPath {
+		return curPkg, nil
+	}
+
 	// If the path is listed in the top-level ImportMap, use its mapping instead.
 	// This is a common scenario when dealing with vendored packages in GOROOT.
 	// The map is flat, so we don't need to recurse.
@@ -294,8 +239,35 @@ func listPackage(path string) (*listedPackage, error) {
 	}
 
 	pkg, ok := cache.ListedPackages[path]
+
+	// The runtime may list any package in std, even those it doesn't depend on.
+	// This is due to how it linkname-implements std packages,
+	// such as sync/atomic or reflect, without importing them in any way.
+	// If ListedPackages lacks such a package we fill it with "std".
+	if curPkg.ImportPath == "runtime" {
+		if ok {
+			return pkg, nil
+		}
+		// TODO: List fewer packages here. std is 200+ packages,
+		// but in reality we should only miss 20-30 packages at most.
+		if err := appendListedPackages("std"); err != nil {
+			panic(err) // should never happen
+		}
+		pkg, ok := cache.ListedPackages[path]
+		if !ok {
+			panic(fmt.Sprintf("runtime listed a std package we can't find: %s", path))
+		}
+		return pkg, nil
+	}
+	// Packages other than runtime can list any package,
+	// as long as they depend on it directly or indirectly.
 	if !ok {
 		return nil, fmt.Errorf("path not found in listed packages: %s", path)
 	}
-	return pkg, nil
+	for _, dep := range curPkg.Deps {
+		if dep == pkg.ImportPath {
+			return pkg, nil
+		}
+	}
+	return nil, fmt.Errorf("refusing to list non-dependency package: %s", path)
 }

@@ -1,19 +1,29 @@
+# Ensure that "does not match any packages" works with GOPRIVATE and GOGARBLE.
+env GOGARBLE=match-absolutely/nothing
+! garble build -o=out ./standalone
+stderr '^GOGARBLE="match-absolutely/nothing" does not match any packages to be built$'
+
+env GOGARBLE=
 env GOPRIVATE=match-absolutely/nothing
 ! garble build -o=out ./standalone
-stderr '^GOPRIVATE="match-absolutely/nothing" does not match any packages to be built$'
+stderr '^GOGARBLE="match-absolutely/nothing" does not match any packages to be built$'
 
-env GOPRIVATE=test/main/imported
-garble build ./importer
+# A build where just some packages are obfuscated.
+env GOGARBLE=test/main/imported
+garble -literals build -o=out ./importer
+
+! binsubstr out 'some long string to obfuscate'
+binsubstr out 'some long string to not obfuscate'
 
 # Obfuscated packages which import non-obfuscated std packages.
 # Some of the imported std packages use "import maps" due to vendoring,
 # and a past bug made this case fail for "garble build".
-env GOPRIVATE=test/main
+env GOGARBLE=test/main
 garble build -o=out ./stdimporter
 
 [short] stop # rebuilding std is slow
 
-env GOPRIVATE='*'
+env GOGARBLE='*'
 
 # Try garbling all of std, given some std packages.
 # No need for a main package here; building the std packages directly works the
@@ -28,10 +38,13 @@ garble build std
 # support ImportMap when linking.
 garble build -o=out ./stdimporter
 
-# Also check that a full rebuild is reproducible,
-# with -a to rebuild all packages.
+# Also check that a full rebuild is reproducible, via a new GOCACHE.
 # This is slow, but necessary to uncover bugs hidden by the build cache.
-garble build -o=out_rebuild -a ./stdimporter
+# We also forcibly rebuild runtime on its own, given it used to be non-reproducible
+# due to its use of linknames pointing at std packages it doesn't depend upon.
+env GOCACHE=${WORK}/gocache-empty
+garble build -a runtime
+garble build -o=out_rebuild ./stdimporter
 bincmp out_rebuild out
 
 -- go.mod --
@@ -43,15 +56,18 @@ package main
 
 func main() {}
 -- importer/importer.go --
-package importer
+package main
 
 import "test/main/imported"
 
-var _ = imported.Name
+func main() {
+	println(imported.LongString)
+	println("some long string to not obfuscate")
+}
 -- imported/imported.go --
 package imported
 
-var Name = "value"
+var LongString = "some long string to obfuscate"
 -- stdimporter/main.go --
 package main
 

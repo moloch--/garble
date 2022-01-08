@@ -8,7 +8,6 @@ import (
 	"go/ast"
 	"go/token"
 	mathrand "math/rand"
-	"os"
 )
 
 // obfuscator takes a byte slice and converts it to a ast.BlockStmt
@@ -16,17 +15,14 @@ type obfuscator interface {
 	obfuscate(data []byte) *ast.BlockStmt
 }
 
-var (
-	// obfuscators contains all types which implement the obfuscator Interface
-	obfuscators = []obfuscator{
-		simple{},
-		swap{},
-		split{},
-		shuffle{},
-		seed{},
-	}
-	envGarbleSeed = os.Getenv("GARBLE_SEED")
-)
+// obfuscators contains all types which implement the obfuscator Interface
+var obfuscators = []obfuscator{
+	simple{},
+	swap{},
+	split{},
+	shuffle{},
+	seed{},
+}
 
 // If math/rand.Seed() is not called, the generator behaves as if seeded by rand.Seed(1),
 // so the generator is deterministic.
