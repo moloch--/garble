@@ -47,18 +47,18 @@ import (
 var flagSet = flag.NewFlagSet("garble", flag.ContinueOnError)
 
 var (
-	flagObfuscateLiterals   bool
-	flagGarbleTiny          bool
-	flagDebugDir            string
-	flagSeed                string
-	flagLiteralMaxSizeBytes int
+	flagLiterals bool
+	flagTiny     bool
+	flagDebug    bool
+	flagDebugDir string
+	flagSeed     seedFlag
 )
 
 func init() {
 	flagSet.Usage = usage
-	flagSet.BoolVar(&flagObfuscateLiterals, "literals", false, "Obfuscate literals such as strings")
-	flagSet.IntVar(&flagLiteralMaxSizeBytes, "literals-max-size", 32*1024, "Max size of literals to obfuscate (WARNING: May cause significant memory usage)")
-	flagSet.BoolVar(&flagGarbleTiny, "tiny", false, "Optimize for binary size, losing some ability to reverse the process")
+	flagSet.BoolVar(&flagLiterals, "literals", false, "Obfuscate literals such as strings")
+	flagSet.BoolVar(&flagTiny, "tiny", false, "Optimize for binary size, losing some ability to reverse the process")
+	flagSet.BoolVar(&flagDebug, "debug", false, "Print debug logs to stderr")
 	flagSet.StringVar(&flagDebugDir, "debugdir", "", "Write the obfuscated source to a directory, e.g. -debugdir=out")
 	flagSet.Var(&flagSeed, "seed", "Provide a base64-encoded seed, e.g. -seed=o9WDTZ4CN4w\nFor a random seed, provide -seed=random")
 }
@@ -1544,9 +1544,15 @@ func (tf *transformer) removeUnnecessaryImports(file *ast.File) {
 }
 
 // transformGo obfuscates the provided Go syntax file.
-func (tf *transformer) transformGo(file *ast.File) *ast.File {
-	if opts.ObfuscateLiterals {
-		file = literals.Obfuscate(file, tf.info, fset, opts.LiteralMaxSizeBytes, tf.ignoreObjects)
+func (tf *transformer) transformGo(filename string, file *ast.File) *ast.File {
+	// Only obfuscate the literals here if the flag is on
+	// and if the package in question is to be obfuscated.
+	//
+	// We can't obfuscate literals in the runtime and its dependencies,
+	// because obfuscated literals sometimes escape to heap,
+	// and that's not allowed in the runtime itself.
+	if flagLiterals && curPkg.ToObfuscate {
+		file = literals.Obfuscate(file, tf.info, fset, tf.linkerVariableStrings)
 	}
 
 	pre := func(cursor *astutil.Cursor) bool {
