@@ -57,7 +57,7 @@ var (
 
 func init() {
 	flagSet.Usage = usage
-	flagSet.IntVar(&flagLiteralMaxSizeBytes, "literals-max-size", 32*1024, "Max size of literals to obfuscate (WARNING: May cause significant memory usage)")
+	flagSet.IntVar(&flagLiteralMaxSizeBytes, "literals-max-size", 4*1024, "Max size of literals to obfuscate (WARNING: May cause significant memory usage)")
 	flagSet.BoolVar(&flagLiterals, "literals", false, "Obfuscate literals such as strings")
 	flagSet.BoolVar(&flagTiny, "tiny", false, "Optimize for binary size, losing some ability to reverse the process")
 	flagSet.BoolVar(&flagDebug, "debug", false, "Print debug logs to stderr")
