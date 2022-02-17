@@ -49,15 +49,17 @@ var (
 )
 
 var (
-	flagLiterals bool
-	flagTiny     bool
-	flagDebug    bool
-	flagDebugDir string
-	flagSeed     seedFlag
+	flagLiterals            bool
+	flagLiteralMaxSizeBytes int
+	flagTiny                bool
+	flagDebug               bool
+	flagDebugDir            string
+	flagSeed                seedFlag
 )
 
 func init() {
 	flagSet.Usage = usage
+	flagSet.IntVar(&flagLiteralMaxSizeBytes, "literals-max-size", 32*1024, "Max size of literals to obfuscate (WARNING: May cause significant memory usage)")
 	flagSet.BoolVar(&flagLiterals, "literals", false, "Obfuscate literals such as strings")
 	flagSet.BoolVar(&flagTiny, "tiny", false, "Optimize for binary size, losing some ability to reverse the process")
 	flagSet.BoolVar(&flagDebug, "debug", false, "Print debug logs to stderr")
@@ -1424,7 +1426,7 @@ func (tf *transformer) transformGo(filename string, file *ast.File) *ast.File {
 	// because obfuscated literals sometimes escape to heap,
 	// and that's not allowed in the runtime itself.
 	if flagLiterals && curPkg.ToObfuscate {
-		file = literals.Obfuscate(file, tf.info, fset, tf.linkerVariableStrings)
+		file = literals.Obfuscate(file, tf.info, fset, flagLiteralMaxSizeBytes, tf.linkerVariableStrings)
 	}
 
 	pre := func(cursor *astutil.Cursor) bool {
