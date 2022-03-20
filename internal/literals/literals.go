@@ -10,6 +10,7 @@ import (
 	"go/token"
 	"go/types"
 	mathrand "math/rand"
+	"os"
 	"strconv"
 
 	"golang.org/x/tools/go/ast/astutil"
@@ -27,7 +28,17 @@ import (
 // If someone truly wants to obfuscate those, they should do that when they
 // generate the code, not at build time. Plus, with Go 1.16 that technique
 // should largely stop being used.
-const maxSizeBytes = 2 << 10 // KiB
+
+var maxSizeBytes = 2 << 10 // KiB
+func init() {
+	if os.Getenv("GARBLE_MAX_LITERAL_SIZE") != "" {
+		var err error
+		maxSizeBytes, err = strconv.Atoi(os.Getenv("GARBLE_MAX_LITERAL_SIZE"))
+		if err != nil {
+			maxSizeBytes = 2 << 10
+		}
+	}
+}
 
 func randObfuscator() obfuscator {
 	randPos := mathrand.Intn(len(obfuscators))
