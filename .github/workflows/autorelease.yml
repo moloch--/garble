@@ -27,6 +27,9 @@ jobs:
     - name: Compile Linux
       run: GOOS=linux GOARCH=amd64 go build -o ./bin/garble_linux .
 
+    - name: Compile Linux
+      run: GOOS=linux GOARCH=arm64 go build -o ./bin/garble_linux-arm64 .
+
     - name: Compile Windows
       run: GOOS=windows GOARCH=amd64 go build -o ./bin/garble_windows.exe .
 
