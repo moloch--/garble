@@ -10,11 +10,14 @@ import (
 	"go/parser"
 	"go/printer"
 	"path/filepath"
-	"sort"
 	"strings"
+
+	"golang.org/x/exp/slices"
 )
 
 func isDirective(text string) bool {
+	// TODO: can we remove the check for "// +build" now that we require Go 1.18
+	// or later? we should update the tests too.
 	return strings.HasPrefix(text, "//go:") || strings.HasPrefix(text, "// +build")
 }
 
@@ -118,8 +121,8 @@ func printFile(file1 *ast.File) ([]byte, error) {
 	})
 
 	// We add comments in order.
-	sort.Slice(toAdd, func(i, j int) bool {
-		return toAdd[i].offset < toAdd[j].offset
+	slices.SortFunc(toAdd, func(a, b commentToAdd) bool {
+		return a.offset < b.offset
 	})
 
 	copied := 0

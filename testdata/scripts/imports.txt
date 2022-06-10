@@ -45,10 +45,11 @@ cmp stdout main.stdout
 -- go.mod --
 module test/main
 
-go 1.17
+go 1.18
 
 require (
 	gopkg.in/garbletest.v2 v2.999.0
+	gopkg.in/garbletestconst.v2 v2.999.0
 	rsc.io/quote v1.5.2
 )
 
@@ -62,6 +63,8 @@ golang.org/x/text v0.0.0-20170915032832-14c0d48ead0c h1:pvCbr/wm8HzDD3fVywevekuf
 golang.org/x/text v0.0.0-20170915032832-14c0d48ead0c/go.mod h1:NqM8EUOU14njkJ3fqMW+pc6Ldnwhi/IjpwHt7yyuwOQ=
 gopkg.in/garbletest.v2 v2.999.0 h1:XHlBQi3MAcJL2fjNiEPAPAilkzc7hAv4vyyjY5w+IUY=
 gopkg.in/garbletest.v2 v2.999.0/go.mod h1:MI9QqKJD8i8oL8mW/bR0qq19/VuezEdJbVvl2B8Pa40=
+gopkg.in/garbletestconst.v2 v2.999.0 h1:VABqc63EJolbOSh1+WlSSQmX8ZT7VIs53mKCGxECTH8=
+gopkg.in/garbletestconst.v2 v2.999.0/go.mod h1:QA2FI8zGZhhsdLJGUrq78ah+ohEZo9ZDw3ex+C2WVEc=
 rsc.io/quote v1.5.2 h1:3fEykkD9k7lYzXqCYrwGAf7iNhbk4yCjHmKBN9td4L0=
 rsc.io/quote v1.5.2/go.mod h1:LzX7hefJvL54yjefDEDHNONDjII0t9xZLPXsUe+TKr0=
 rsc.io/sampler v1.3.0 h1:+lXbM7nYGGOYhnMEiMtjCwcUfjn4sajeMm15HMT6SnU=
@@ -73,12 +76,13 @@ package main
 
 import (
 	"fmt"
-	"strings"
+	"database/sql"
 
 	"test/main/importedpkg"
 
 	"rsc.io/quote"
 	garbletest "gopkg.in/garbletest.v2"
+	garbletestconst "gopkg.in/garbletestconst.v2"
 )
 
 func main() {
@@ -91,10 +95,8 @@ func main() {
 
 	fmt.Println(quote.Go())
 	garbletest.Test()
-}
-
-func printfWithoutPackage(format string, v interface{}) {
-	fmt.Print(strings.Split(fmt.Sprintf(format, v), ".")[1])
+	fmt.Println(garbletestconst.StrConst)
+	fmt.Println(sql.Drivers()[0])
 }
 -- notag_fail.go --
 // +build !buildtag
@@ -113,9 +115,13 @@ func init() { fmt.Println("buildtag init func") }
 -- differentpkg_unnamed.go --
 package main
 
-import "test/main/different-pkg-name"
+import (
+	"test/main/different-pkg-name"
+	"test/main/goextension.go"
+)
 
 var _ = actualpkgname.Noop
+var _ = goextension.Noop
 -- differentpkg_named.go --
 package main
 
@@ -157,6 +163,10 @@ package actualpkgname
 
 var Noop int
 
+-- goextension.go/ext.go --
+package goextension
+
+var Noop int
 -- main.stdout --
 buildtag init func
 imported var value
@@ -164,3 +174,5 @@ imported const value
 x
 {3 {23} 0}
 Don't communicate by sharing memory, share memory by communicating.
+42
+dummy

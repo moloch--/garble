@@ -53,6 +53,11 @@ var update = flag.Bool("u", false, "update testscript output files")
 func TestScripts(t *testing.T) {
 	t.Parallel()
 
+	execPath, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	p := testscript.Params{
 		Dir: filepath.Join("testdata", "scripts"),
 		Setup: func(env *testscript.Env) error {
@@ -77,12 +82,15 @@ func TestScripts(t *testing.T) {
 				"GOGC=off",
 
 				"gofullversion="+runtime.Version(),
+				"EXEC_PATH="+execPath,
 			)
 
 			if os.Getenv("TESTSCRIPT_COVER_DIR") != "" {
 				// Don't reuse the build cache if we want to collect
 				// code coverage. Otherwise, many toolexec calls would
 				// be avoided and the coverage would be incomplete.
+				// TODO: to not make "go test" insanely slow, we could still use
+				// an empty GOCACHE, but share it between all the test scripts.
 				env.Vars = append(env.Vars, "GOCACHE="+filepath.Join(env.WorkDir, "go-cache-tmp"))
 			}
 			return nil

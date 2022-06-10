@@ -8,6 +8,7 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -64,14 +65,14 @@ func loadSharedCache() error {
 	startTime := time.Now()
 	f, err := os.Open(filepath.Join(sharedTempDir, "main-cache.gob"))
 	if err != nil {
-		return fmt.Errorf(`cannot open shared file, this is most likely due to not running "garble [command]"`)
+		return fmt.Errorf(`cannot open shared file: %v; did you run "garble [command]"?`, err)
 	}
 	defer func() {
-		debugf("shared cache loaded in %s from %s", debugSince(startTime), f.Name())
+		log.Printf("shared cache loaded in %s from %s", debugSince(startTime), f.Name())
 	}()
 	defer f.Close()
 	if err := gob.NewDecoder(f).Decode(&cache); err != nil {
-		return err
+		return fmt.Errorf("cannot decode shared file: %v", err)
 	}
 	return nil
 }
@@ -113,7 +114,7 @@ func writeFileExclusive(name string, data []byte) error {
 	return err
 }
 
-func writeGobExclusive(name string, val interface{}) error {
+func writeGobExclusive(name string, val any) error {
 	f, err := createExclusive(name)
 	if err != nil {
 		return err
@@ -139,20 +140,23 @@ type listedPackage struct {
 	ImportMap  map[string]string
 	Standard   bool
 
-	Dir     string
-	GoFiles []string
-	Imports []string
+	Dir        string
+	GoFiles    []string
+	Imports    []string
+	Incomplete bool
 
 	// The fields below are not part of 'go list', but are still reused
 	// between garble processes. Use "Garble" as a prefix to ensure no
 	// collisions with the JSON fields from 'go list'.
 
-	// TODO(mvdan): consider filling this iff ToObfuscate==true,
-	// which will help ensure we don't obfuscate any of their names otherwise.
-	GarbleActionID []byte
+	// GarbleActionID is a hash combining the Action ID from BuildID,
+	// with Garble's own inputs as per addGarbleToHash.
+	// It is set even when ToObfuscate is false, as it is also used for random
+	// seeds and build cache paths, and not just to obfuscate names.
+	GarbleActionID []byte `json:"-"`
 
 	// ToObfuscate records whether the package should be obfuscated.
-	ToObfuscate bool
+	ToObfuscate bool `json:"-"`
 }
 
 func (p *listedPackage) obfuscatedImportPath() string {
@@ -165,7 +169,7 @@ func (p *listedPackage) obfuscatedImportPath() string {
 		return p.ImportPath
 	}
 	newPath := hashWithPackage(p, p.ImportPath)
-	debugf("import path %q hashed with %x to %q", p.ImportPath, p.GarbleActionID, newPath)
+	log.Printf("import path %q hashed with %x to %q", p.ImportPath, p.GarbleActionID, newPath)
 	return newPath
 }
 
@@ -176,7 +180,7 @@ func appendListedPackages(packages []string, withDeps bool) error {
 	// TODO: perhaps include all top-level build flags set by garble,
 	// including -buildvcs=false.
 	// They shouldn't affect "go list" here, but might as well be consistent.
-	args := []string{"list", "-json", "-export", "-trimpath"}
+	args := []string{"list", "-json", "-export", "-trimpath", "-e"}
 	if withDeps {
 		args = append(args, "-deps")
 	}
@@ -185,7 +189,7 @@ func appendListedPackages(packages []string, withDeps bool) error {
 	cmd := exec.Command("go", args...)
 
 	defer func() {
-		debugf("original build info obtained in %s via: go %s", debugSince(startTime), strings.Join(args, " "))
+		log.Printf("original build info obtained in %s via: go %s", debugSince(startTime), strings.Join(args, " "))
 	}()
 
 	stdout, err := cmd.StdoutPipe()
@@ -209,6 +213,13 @@ func appendListedPackages(packages []string, withDeps bool) error {
 		if err := dec.Decode(&pkg); err != nil {
 			return err
 		}
+
+		// Note that we use the `-e` flag above with `go list`.
+		// If a package fails to load, the Incomplete and Error fields will be set.
+		// We still record failed packages in the ListedPackages map,
+		// because some like crypto/internal/boring/fipstls simply fall under
+		// "build constraints exclude all Go files" and can be ignored.
+		// Real build errors will still be surfaced by `go build -toolexec` later.
 		if cache.ListedPackages[pkg.ImportPath] != nil {
 			return fmt.Errorf("duplicate package: %q", pkg.ImportPath)
 		}
@@ -235,6 +246,9 @@ func appendListedPackages(packages []string, withDeps bool) error {
 		case cannotObfuscate[path], runtimeAndDeps[path]:
 			// We don't support obfuscating these yet.
 
+		case pkg.Incomplete:
+			// We can't obfuscate packages which weren't loaded.
+
 		case pkg.Name == "main" && strings.HasSuffix(path, ".test"),
 			path == "command-line-arguments",
 			strings.HasPrefix(path, "plugin/unnamed"),
@@ -253,27 +267,17 @@ func appendListedPackages(packages []string, withDeps bool) error {
 	return nil
 }
 
-// cannotObfuscate is a list of some packages the runtime depends on, or
-// packages which the runtime points to via go:linkname.
-//
-// Once we support go:linkname well and once we can obfuscate the runtime
-// package, this entire map can likely go away.
+// cannotObfuscate is a list of some standard library packages we currently
+// cannot obfuscate. Note that this list currently sits on top of
+// runtimeAndDeps, which are currently not obfuscated either.
 //
 // TODO: investigate and resolve each one of these
 var cannotObfuscate = map[string]bool{
-	// not a "real" package
-	"unsafe": true,
-
-	// some linkname failure
-	"time":          true,
-	"runtime/pprof": true,
+	// some relocation failure
+	"time": true,
 
 	// all kinds of stuff breaks when obfuscating the runtime
-	"syscall":      true,
-	"internal/abi": true,
-
-	// rebuilds don't work
-	"os/signal": true,
+	"syscall": true,
 
 	// cgo breaks otherwise
 	"runtime/cgo": true,
@@ -283,9 +287,6 @@ var cannotObfuscate = map[string]bool{
 
 	// cgo heavy net doesn't like to be obfuscated
 	"net": true,
-
-	// some linkname failure
-	"crypto/x509/internal/macos": true,
 }
 
 // Obtained from "go list -deps runtime" on Go 1.18beta1.
@@ -335,6 +336,8 @@ func listPackage(path string) (*listedPackage, error) {
 		startTime := time.Now()
 		// Obtained via scripts/runtime-linknamed-nodeps.sh as of Go 1.18beta1.
 		runtimeLinknamed := []string{
+			"crypto/internal/boring",
+			"crypto/internal/boring/fipstls",
 			"crypto/x509/internal/macos",
 			"internal/poll",
 			"internal/reflectlite",
@@ -375,7 +378,7 @@ func listPackage(path string) (*listedPackage, error) {
 			panic(fmt.Sprintf("runtime listed a std package we can't find: %s", path))
 		}
 		listedRuntimeLinknamed = true
-		debugf("listed %d missing runtime-linknamed packages in %s", len(missing), debugSince(startTime))
+		log.Printf("listed %d missing runtime-linknamed packages in %s", len(missing), debugSince(startTime))
 		return pkg, nil
 	}
 	// Packages other than runtime can list any package,

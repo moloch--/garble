@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 61
     strategy:
       matrix:
-        go-version: [1.17.x, 1.18.x]
+        go-version: [1.18.x]
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
@@ -31,7 +31,7 @@ jobs:
     steps:
     - name: Install Go
       env:
-        GO_COMMIT: e475cf2e705d4eda8647426e060898ab3f643610 # 2022-03-14
+        GO_COMMIT: 2882786bf4cd779f166e9ced82a4da2ea0f8b1f9 # 2022-06-08
       run: |
         cd $HOME
         mkdir $HOME/gotip
@@ -57,3 +57,4 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - run: ./scripts/crlf-test.sh
+      run: go test -timeout=15m ./...

@@ -20,7 +20,6 @@ import (
 func commandReverse(args []string) error {
 	flags, args := splitFlagsFromArgs(args)
 	if hasHelpFlag(flags) || len(args) == 0 {
-		// TODO: cover this in the tests.
 		fmt.Fprintf(os.Stderr, `
 usage: garble [garble flags] reverse [build flags] package [files]
 
@@ -163,11 +162,11 @@ One can reverse a captured panic stack trace as follows:
 			return err
 		}
 		defer f.Close()
-		any, err := reverseContent(os.Stdout, f, repl)
+		modified, err := reverseContent(os.Stdout, f, repl)
 		if err != nil {
 			return err
 		}
-		anyModified = anyModified || any
+		anyModified = anyModified || modified
 		f.Close() // since we're in a loop
 	}
 	if !anyModified {
