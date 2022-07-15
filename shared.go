@@ -243,7 +243,7 @@ func appendListedPackages(packages []string, withDeps bool) error {
 		// Test main packages like "foo/bar.test" are always obfuscated,
 		// just like main packages.
 		switch {
-		case cannotObfuscate[path], runtimeAndDeps[path]:
+		case cannotObfuscate[path]:
 			// We don't support obfuscating these yet.
 
 		case pkg.Incomplete:
@@ -268,41 +268,34 @@ func appendListedPackages(packages []string, withDeps bool) error {
 }
 
 // cannotObfuscate is a list of some standard library packages we currently
-// cannot obfuscate. Note that this list currently sits on top of
-// runtimeAndDeps, which are currently not obfuscated either.
+// cannot obfuscate.
 //
 // TODO: investigate and resolve each one of these
 var cannotObfuscate = map[string]bool{
-	// some relocation failure
+	// "undefined reference" errors at link time
 	"time": true,
 
-	// all kinds of stuff breaks when obfuscating the runtime
+	// "//go:linkname must refer to declared function or variable"
 	"syscall": true,
 
-	// cgo breaks otherwise
+	// "unknown pc" crashes on windows in the cgo test otherwise
 	"runtime/cgo": true,
 
-	// garble reverse breaks otherwise
-	"runtime/debug": true,
-
-	// cgo heavy net doesn't like to be obfuscated
-	"net": true,
-}
-
-// Obtained from "go list -deps runtime" on Go 1.18beta1.
-// Note that the same command on Go 1.17 results in a subset of this list.
-var runtimeAndDeps = map[string]bool{
-	"internal/goarch":         true,
-	"unsafe":                  true,
-	"internal/abi":            true,
-	"internal/cpu":            true,
-	"internal/bytealg":        true,
-	"internal/goexperiment":   true,
-	"internal/goos":           true,
-	"runtime/internal/atomic": true,
-	"runtime/internal/math":   true,
-	"runtime/internal/sys":    true,
-	"runtime":                 true,
+	// We do not support obfuscating the runtime nor its dependencies.
+	// Obtained from "go list -deps runtime" as of June 29th.
+	// Note that the same command on Go 1.18 results in the same list.
+	"internal/goarch":          true,
+	"unsafe":                   true,
+	"internal/abi":             true,
+	"internal/cpu":             true,
+	"internal/bytealg":         true,
+	"internal/goexperiment":    true,
+	"internal/goos":            true,
+	"runtime/internal/atomic":  true,
+	"runtime/internal/math":    true,
+	"runtime/internal/sys":     true,
+	"runtime/internal/syscall": true,
+	"runtime":                  true,
 }
 
 var listedRuntimeLinknamed = false
@@ -334,9 +327,10 @@ func listPackage(path string) (*listedPackage, error) {
 			panic(fmt.Sprintf("package %q still missing after go list call", path))
 		}
 		startTime := time.Now()
-		// Obtained via scripts/runtime-linknamed-nodeps.sh as of Go 1.18beta1.
+		// Obtained via scripts/runtime-linknamed-nodeps.sh as of June 29th.
 		runtimeLinknamed := []string{
 			"crypto/internal/boring",
+			"crypto/internal/boring/bcache",
 			"crypto/internal/boring/fipstls",
 			"crypto/x509/internal/macos",
 			"internal/poll",

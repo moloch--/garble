@@ -34,6 +34,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"golang.org/x/exp/maps"
 	"golang.org/x/exp/slices"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
@@ -378,6 +379,7 @@ func mainErr(args []string) error {
 		return commandReverse(args)
 	case "build", "test":
 		cmd, err := toolexecCmd(command, args)
+		defer os.RemoveAll(os.Getenv("GARBLE_SHARED"))
 		if err != nil {
 			return err
 		}
@@ -512,7 +514,6 @@ This command wraps "go %s". Below is its help:
 		return nil, err
 	}
 	os.Setenv("GARBLE_SHARED", sharedTempDir)
-	defer os.Remove(sharedTempDir)
 	wd, err := os.Getwd()
 	if err != nil {
 		return nil, err
@@ -612,6 +613,7 @@ func transformAsm(args []string) ([]string, error) {
 	const middleDot = '·'
 	middleDotLen := utf8.RuneLen(middleDot)
 
+	var buf bytes.Buffer
 	for _, path := range paths {
 		// Read the entire file into memory.
 		// If we find issues with large files, we can use bufio.
@@ -619,10 +621,10 @@ func transformAsm(args []string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
+		buf.Reset()
 
 		// Find all middle-dot names, and replace them.
 		remaining := content
-		var buf bytes.Buffer
 		for {
 			i := bytes.IndexRune(remaining, middleDot)
 			if i < 0 {
@@ -670,7 +672,9 @@ func transformAsm(args []string) ([]string, error) {
 			}
 
 			newName := hashWithPackage(curPkg, name)
-			log.Printf("asm name %q hashed with %x to %q", name, curPkg.GarbleActionID, newName)
+			if flagDebug { // TODO(mvdan): remove once https://go.dev/issue/53465 if fixed
+				log.Printf("asm name %q hashed with %x to %q", name, curPkg.GarbleActionID, newName)
+			}
 			buf.WriteString(newName)
 		}
 
@@ -715,18 +719,9 @@ func transformCompile(args []string) ([]string, error) {
 	// generating it.
 	flags = append(flags, "-dwarf=false")
 
-	for i, path := range paths {
-		if filepath.Base(path) == "_gomod_.go" {
-			// never include module info
-			// TODO: this seems to no longer trigger for our tests?
-			paths = append(paths[:i], paths[i+1:]...)
-			break
-		}
-	}
-
 	var files []*ast.File
 	for _, path := range paths {
-		file, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+		file, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution|parser.ParseComments)
 		if err != nil {
 			return nil, err
 		}
@@ -991,6 +986,7 @@ func processImportCfg(flags []string) (newImportCfg string, _ error) {
 			// See exporttest/*.go in testdata/scripts/test.txt.
 			// For now, spot the pattern and avoid the unnecessary error;
 			// the dependency is unused, so the packagefile line is redundant.
+			// This still triggers as of go1.19beta1.
 			if strings.HasSuffix(curPkg.ImportPath, ".test]") && strings.HasPrefix(curPkg.ImportPath, impPath) {
 				continue
 			}
@@ -1034,6 +1030,9 @@ type (
 var knownCannotObfuscateUnexported = map[types.Object]bool{}
 
 // cachedOutput contains information that will be stored as per garbleExportFile.
+// Note that cachedOutput gets loaded from all direct package dependencies,
+// and gets filled while obfuscating the current package, so it ends up
+// containing entries for the current package and its transitive dependencies.
 var cachedOutput = struct {
 	// KnownReflectAPIs is a static record of what std APIs use reflection on their
 	// parameters, so we can avoid obfuscating types used with them.
@@ -1043,7 +1042,7 @@ var cachedOutput = struct {
 	KnownReflectAPIs map[funcFullName][]reflectParameter
 
 	// KnownCannotObfuscate is filled with the fully qualified names from each
-	// package that we could not obfuscate as per cannotObfuscateNames.
+	// package that we cannot obfuscate.
 	// This record is necessary for knowing what names from imported packages
 	// weren't obfuscated, so we can obfuscate their local uses accordingly.
 	KnownCannotObfuscate map[objectString]struct{}
@@ -1118,12 +1117,13 @@ func loadCachedOutputs() error {
 }
 
 func (tf *transformer) findReflectFunctions(files []*ast.File) {
+	seenReflectParams := make(map[*types.Var]bool)
 	visitFuncDecl := func(funcDecl *ast.FuncDecl) {
-		funcObj := tf.info.ObjectOf(funcDecl.Name).(*types.Func)
+		funcObj := tf.info.Defs[funcDecl.Name].(*types.Func)
 		funcType := funcObj.Type().(*types.Signature)
 		funcParams := funcType.Params()
 
-		seenReflectParams := make(map[*types.Var]bool)
+		maps.Clear(seenReflectParams)
 		for i := 0; i < funcParams.Len(); i++ {
 			seenReflectParams[funcParams.At(i)] = false
 		}
@@ -1137,7 +1137,7 @@ func (tf *transformer) findReflectFunctions(files []*ast.File) {
 			if !ok {
 				return true
 			}
-			calledFunc, _ := tf.info.ObjectOf(sel.Sel).(*types.Func)
+			calledFunc, _ := tf.info.Uses[sel.Sel].(*types.Func)
 			if calledFunc == nil || calledFunc.Pkg() == nil {
 				return true
 			}
@@ -1158,7 +1158,7 @@ func (tf *transformer) findReflectFunctions(files []*ast.File) {
 					if !ok {
 						continue
 					}
-					obj, _ := tf.info.ObjectOf(ident).(*types.Var)
+					obj, _ := tf.info.Uses[ident].(*types.Var)
 					if obj == nil {
 						continue
 					}
@@ -1211,7 +1211,7 @@ func (tf *transformer) findReflectFunctions(files []*ast.File) {
 // Since we obfuscate one package at a time, we only detect those if the type
 // definition and the reflect usage are both in the same package.
 func (tf *transformer) prefillObjectMaps(files []*ast.File) error {
-	tf.linkerVariableStrings = make(map[types.Object]string)
+	tf.linkerVariableStrings = make(map[*types.Var]string)
 
 	// TODO: this is a linker flag that affects how we obfuscate a package at
 	// compile time. Note that, if the user changes ldflags, then Go may only
@@ -1246,9 +1246,9 @@ func (tf *transformer) prefillObjectMaps(files []*ast.File) error {
 			return // not the current package
 		}
 
-		obj := tf.pkg.Scope().Lookup(name)
+		obj, _ := tf.pkg.Scope().Lookup(name).(*types.Var)
 		if obj == nil {
-			return // not found; skip
+			return // no such variable; skip
 		}
 		tf.linkerVariableStrings[obj] = stringValue
 	})
@@ -1269,7 +1269,7 @@ func (tf *transformer) prefillObjectMaps(files []*ast.File) error {
 			ident = sel.Sel
 		}
 
-		fnType, _ := tf.info.ObjectOf(ident).(*types.Func)
+		fnType, _ := tf.info.Uses[ident].(*types.Func)
 		if fnType == nil || fnType.Pkg() == nil {
 			return true
 		}
@@ -1290,21 +1290,6 @@ func (tf *transformer) prefillObjectMaps(files []*ast.File) error {
 		return true
 	}
 	for _, file := range files {
-		for _, group := range file.Comments {
-			for _, comment := range group.List {
-				name := strings.TrimPrefix(comment.Text, "//export ")
-				if name == comment.Text {
-					continue
-				}
-				name = strings.TrimSpace(name)
-				obj := tf.pkg.Scope().Lookup(name)
-				if obj == nil {
-					continue // not found; skip
-				}
-				// TODO(mvdan): it seems like removing this doesn't break any tests.
-				recordAsNotObfuscated(obj)
-			}
-		}
 		ast.Inspect(file, visit)
 	}
 	return nil
@@ -1320,10 +1305,11 @@ type transformer struct {
 	// linkerVariableStrings is also initialized by prefillObjectMaps.
 	// It records objects for variables used in -ldflags=-X flags,
 	// as well as the strings the user wants to inject them with.
-	linkerVariableStrings map[types.Object]string
+	linkerVariableStrings map[*types.Var]string
 
-	// recordTypeDone helps avoid cycles in recordType.
-	recordTypeDone map[types.Type]bool
+	// recordTypeDone helps avoid type cycles in recordType.
+	// We only need to track named types, as all cycles must use them.
+	recordTypeDone map[*types.Named]bool
 
 	// fieldToStruct helps locate struct types from any of their field
 	// objects. Useful when obfuscating field names.
@@ -1338,7 +1324,7 @@ func newTransformer() *transformer {
 			Defs:  make(map[*ast.Ident]types.Object),
 			Uses:  make(map[*ast.Ident]types.Object),
 		},
-		recordTypeDone: make(map[types.Type]bool),
+		recordTypeDone: make(map[*types.Named]bool),
 		fieldToStruct:  make(map[*types.Var]*types.Struct),
 	}
 }
@@ -1393,19 +1379,19 @@ func (tf *transformer) typecheck(files []*ast.File) error {
 // Right now, all it does is fill the fieldToStruct field.
 // Since types can be recursive, we need a map to avoid cycles.
 func (tf *transformer) recordType(used, origin types.Type) {
-	if tf.recordTypeDone[used] {
-		return
-	}
 	if origin == nil {
 		origin = used
 	}
 	type Container interface{ Elem() types.Type }
-	tf.recordTypeDone[used] = true
 	switch used := used.(type) {
 	case Container:
 		origin := origin.(Container)
 		tf.recordType(used.Elem(), origin.Elem())
 	case *types.Named:
+		if tf.recordTypeDone[used] {
+			return
+		}
+		tf.recordTypeDone[used] = true
 		// If we have a generic struct like
 		//
 		//	type Foo[T any] struct { Bar T }
@@ -1464,11 +1450,10 @@ func recordedObjectString(obj types.Object) objectString {
 // recordAsNotObfuscated records all the objects whose names we cannot obfuscate.
 // An object is any named entity, such as a declared variable or type.
 //
-// So far, it records:
-//
-//   - Types which are used for reflection.
-//   - Declarations exported via "//export".
-//   - Types or variables from external packages which were not obfuscated.
+// As of June 2022, this only records types which are used in reflection.
+// TODO(mvdan): If this is still the case in a year's time,
+// we should probably rename "not obfuscated" and "cannot obfuscate" to be
+// directly about reflection, e.g. "used in reflection".
 func recordAsNotObfuscated(obj types.Object) {
 	if obj.Pkg().Path() != curPkg.ImportPath {
 		panic("called recordedAsNotObfuscated with a foreign object")
@@ -1694,7 +1679,9 @@ func (tf *transformer) transformGo(file *ast.File) *ast.File {
 				panic("could not find for " + name)
 			}
 			node.Name = hashWithStruct(strct, name)
-			log.Printf("%s %q hashed with struct fields to %q", debugName, name, node.Name)
+			if flagDebug { // TODO(mvdan): remove once https://go.dev/issue/53465 if fixed
+				log.Printf("%s %q hashed with struct fields to %q", debugName, name, node.Name)
+			}
 			return true
 
 		case *types.TypeName:
@@ -1722,7 +1709,9 @@ func (tf *transformer) transformGo(file *ast.File) *ast.File {
 
 		node.Name = hashWithPackage(lpkg, name)
 		// TODO: probably move the debugf lines inside the hash funcs
-		log.Printf("%s %q hashed with %x… to %q", debugName, name, hashToUse[:4], node.Name)
+		if flagDebug { // TODO(mvdan): remove once https://go.dev/issue/53465 if fixed
+			log.Printf("%s %q hashed with %x… to %q", debugName, name, hashToUse[:4], node.Name)
+		}
 		return true
 	}
 	post := func(cursor *astutil.Cursor) bool {
@@ -1748,7 +1737,10 @@ func (tf *transformer) transformGo(file *ast.File) *ast.File {
 		newPath := lpkg.obfuscatedImportPath()
 		imp.Path.Value = strconv.Quote(newPath)
 		if imp.Name == nil {
-			imp.Name = &ast.Ident{Name: lpkg.Name}
+			imp.Name = &ast.Ident{
+				NamePos: imp.Path.ValuePos, // ensure it ends up on the same line
+				Name:    lpkg.Name,
+			}
 		}
 		return true
 	}
@@ -1957,13 +1949,14 @@ var forwardBuildFlags = map[string]bool{
 	"-overlay":       true,
 }
 
-// booleanFlags is obtained from 'go help build' and 'go help testflag' as of Go 1.18beta1.
+// booleanFlags is obtained from 'go help build' and 'go help testflag' as of Go 1.19beta1.
 var booleanFlags = map[string]bool{
 	// Shared build flags.
 	"-a":          true,
 	"-i":          true,
 	"-n":          true,
 	"-v":          true,
+	"-work":       true,
 	"-x":          true,
 	"-race":       true,
 	"-msan":       true,

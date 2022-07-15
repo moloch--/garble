@@ -44,7 +44,9 @@ One can reverse a captured panic stack trace as follows:
 	listArgs = append(listArgs, pkg)
 	// TODO: We most likely no longer need this "list -toolexec" call, since
 	// we use the original build IDs.
-	if _, err := toolexecCmd("list", listArgs); err != nil {
+	_, err := toolexecCmd("list", listArgs)
+	defer os.RemoveAll(os.Getenv("GARBLE_SHARED"))
+	if err != nil {
 		return err
 	}
 
@@ -80,7 +82,7 @@ One can reverse a captured panic stack trace as follows:
 		var files []*ast.File
 		for _, goFile := range lpkg.GoFiles {
 			fullGoFile := filepath.Join(lpkg.Dir, goFile)
-			file, err := parser.ParseFile(fset, fullGoFile, nil, 0)
+			file, err := parser.ParseFile(fset, fullGoFile, nil, parser.SkipObjectResolution)
 			if err != nil {
 				return err
 			}
