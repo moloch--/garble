@@ -16,6 +16,7 @@ See `garble -h` for up to date usage information.
 Produce a binary that works as well as a regular build, but that has as little
 information about the original source code as possible.
 
+
 The tool is designed to be:
 
 * Coupled with `cmd/go`, to support modules and build caching
