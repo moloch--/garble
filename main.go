@@ -1653,6 +1653,9 @@ func (tf *transformer) transformGo(file *ast.File) *ast.File {
 	// and that's not allowed in the runtime itself.
 	if flagLiterals && curPkg.ToObfuscate {
 		file = literals.Obfuscate(file, tf.info, fset, tf.linkerVariableStrings)
+
+		// some imported constants might not be needed anymore, remove unnecessary imports
+		tf.removeUnnecessaryImports(file)
 	}
 
 	pre := func(cursor *astutil.Cursor) bool {
