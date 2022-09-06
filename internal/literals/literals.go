@@ -29,13 +29,14 @@ import (
 // generate the code, not at build time. Plus, with Go 1.16 that technique
 // should largely stop being used.
 
-var maxSizeBytes = 2 << 10 // KiB
+const defaultMaxSizeBytes = 2 << 10    // KiB
+var maxSizeBytes = defaultMaxSizeBytes // KiB
 func init() {
 	if os.Getenv("GARBLE_MAX_LITERAL_SIZE") != "" {
 		var err error
 		maxSizeBytes, err = strconv.Atoi(os.Getenv("GARBLE_MAX_LITERAL_SIZE"))
-		if err != nil {
-			maxSizeBytes = 2 << 10
+		if err != nil || maxSizeBytes < defaultMaxSizeBytes {
+			maxSizeBytes = defaultMaxSizeBytes
 		}
 	}
 }
