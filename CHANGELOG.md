@@ -1,11 +1,13 @@
 # Changelog
 
-## [v0.7.2] - 2022-09-??
+## [v0.7.2] - 2022-09-26
 
-This bugfix release continues support for Go 1.18 and 1.19.
+This bugfix release continues support for Go 1.18 and 1.19 and features:
 
 * Fix an edge case resulting in bad syntax due to comments - [#573]
 * Avoid a panic involving generic code - [#577]
+* Obfuscate Go names in assembly header files - [#553]
+* Support `garble reverse` on packages using cgo or assembly - [#555]
 
 ## [v0.7.1] - 2022-08-02
 
@@ -144,8 +146,11 @@ Known bugs:
 * obfuscating the standard library with `GOPRIVATE=*` is not well supported yet
 * `garble test` is temporarily disabled, as it is currently broken
 
+[v0.7.2]: https://github.com/burrowers/garble/releases/tag/v0.7.2
 [#573]: https://github.com/burrowers/garble/issues/573
 [#577]: https://github.com/burrowers/garble/issues/577
+[#553]: https://github.com/burrowers/garble/issues/553
+[#555]: https://github.com/burrowers/garble/issues/555
 
 [v0.7.1]: https://github.com/burrowers/garble/releases/tag/v0.7.1
 

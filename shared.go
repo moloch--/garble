@@ -33,12 +33,12 @@ type sharedCache struct {
 	// useful for type checking of the packages as we obfuscate them.
 	ListedPackages map[string]*listedPackage
 
-	// We can't rely on the module version to exist,
-	// because it's missing in local builds without 'go install'.
-	// For now, use 'go tool buildid' on the garble binary.
-	// Just like Go's own cache, we use hex-encoded sha256 sums.
-	// Once https://github.com/golang/go/issues/37475 is fixed,
-	// we can likely just use that.
+	// We can't use garble's own module version, as it may not exist.
+	// We can't use the stamped VCS information either,
+	// as uncommitted changes simply show up as "dirty".
+	//
+	// The only unique way to identify garble's version without being published
+	// or committed is to use its content ID from the build cache.
 	BinaryContentID []byte
 
 	GOGARBLE string
@@ -140,10 +140,10 @@ type listedPackage struct {
 	ImportMap  map[string]string
 	Standard   bool
 
-	Dir        string
-	GoFiles    []string
-	Imports    []string
-	Incomplete bool
+	Dir             string
+	CompiledGoFiles []string
+	Imports         []string
+	Incomplete      bool
 
 	// The fields below are not part of 'go list', but are still reused
 	// between garble processes. Use "Garble" as a prefix to ensure no
@@ -180,7 +180,7 @@ func appendListedPackages(packages []string, withDeps bool) error {
 	// TODO: perhaps include all top-level build flags set by garble,
 	// including -buildvcs=false.
 	// They shouldn't affect "go list" here, but might as well be consistent.
-	args := []string{"list", "-json", "-export", "-trimpath", "-e"}
+	args := []string{"list", "-json", "-export", "-compiled", "-trimpath", "-e"}
 	if withDeps {
 		args = append(args, "-deps")
 	}
@@ -227,6 +227,23 @@ func appendListedPackages(packages []string, withDeps bool) error {
 			actionID := decodeHash(splitActionID(pkg.BuildID))
 			pkg.GarbleActionID = addGarbleToHash(actionID)
 		}
+
+		// Work around https://go.dev/issue/28749:
+		// cmd/go puts assembly, C, and C++ files in CompiledGoFiles.
+		//
+		// TODO: remove when upstream has fixed the bug.
+		out := pkg.CompiledGoFiles[:0]
+		for _, path := range pkg.CompiledGoFiles {
+			switch filepath.Ext(path) {
+			case "": // e.g. a generated Go file inside the build cache
+			case ".go":
+			default: // e.g. an assembly file
+				continue
+			}
+			out = append(out, path)
+		}
+		pkg.CompiledGoFiles = out
+
 		cache.ListedPackages[pkg.ImportPath] = &pkg
 	}
 
