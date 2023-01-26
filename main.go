@@ -1393,7 +1393,7 @@ func (tf *transformer) findReflectFunctions(files []*ast.File) {
 // cmd/bundle will include a go:generate directive in its output by default.
 // Ours specifies a version and doesn't assume bundle is in $PATH, so drop it.
 
-//go:generate go run golang.org/x/tools/cmd/bundle@v0.1.9 -o cmdgo_quoted.go -prefix cmdgoQuoted cmd/internal/quoted
+//go:generate go run golang.org/x/tools/cmd/bundle@v0.5.0 -o cmdgo_quoted.go -prefix cmdgoQuoted cmd/internal/quoted
 //go:generate sed -i /go:generate/d cmdgo_quoted.go
 
 // prefillObjectMaps collects objects which should not be obfuscated,
@@ -1691,18 +1691,20 @@ func (tf *transformer) removeUnnecessaryImports(file *ast.File) {
 			return true
 		}
 
-		uses, ok := tf.info.Uses[node].(*types.PkgName)
+		uses, ok := tf.info.Uses[node]
 		if !ok {
 			return true
 		}
 
-		usedImports[uses.Imported().Path()] = true
+		if pkg := uses.Pkg(); pkg != nil {
+			usedImports[pkg.Path()] = true
+		}
 
 		return true
 	})
 
 	for _, imp := range file.Imports {
-		if imp.Name != nil && (imp.Name.Name == "_" || imp.Name.Name == ".") {
+		if imp.Name != nil && imp.Name.Name == "_" {
 			continue
 		}
 
