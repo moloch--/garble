@@ -23,19 +23,19 @@ jobs:
         run: mkdir ./bin
 
       - name: Compile Linux
-        run: GOOS=linux GOARCH=amd64 go build -o ./bin/garble_linux .
+        run: GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o ./bin/garble_linux .
 
       - name: Compile Linux
-        run: GOOS=linux GOARCH=arm64 go build -o ./bin/garble_linux-arm64 .
+        run: GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ./bin/garble_linux-arm64 .
 
       - name: Compile Windows
-        run: GOOS=windows GOARCH=amd64 go build -o ./bin/garble_windows.exe .
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o ./bin/garble_windows.exe .
 
       - name: Make AMD64
-        run: GOOS=darwin GOARCH=amd64 go build -o ./bin/garble_macos-amd64 .
+        run: GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -o ./bin/garble_macos-amd64 .
 
       - name: Make ARM64
-        run: GOOS=darwin GOARCH=arm64 go build -o ./bin/garble_macos-arm64 .
+        run: GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o ./bin/garble_macos-arm64 .
 
       - name: "Publish Release"
         uses: "marvinpinto/action-automatic-releases@latest"
