@@ -40,7 +40,6 @@ import (
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
 	"golang.org/x/tools/go/ast/astutil"
-
 	"mvdan.cc/garble/internal/linker"
 	"mvdan.cc/garble/internal/literals"
 )
@@ -951,7 +950,7 @@ func transformCompile(args []string) ([]string, error) {
 			if flagTiny {
 				// strip unneeded runtime code
 				stripRuntime(basename, file)
-				tf.removeUnnecessaryImports(file)
+				tf.useAllImports(file)
 			}
 			if basename == "symtab.go" {
 				updateMagicValue(file, magicValue())
@@ -1514,9 +1513,10 @@ type transformer struct {
 func newTransformer() *transformer {
 	return &transformer{
 		info: &types.Info{
-			Types: make(map[ast.Expr]types.TypeAndValue),
-			Defs:  make(map[*ast.Ident]types.Object),
-			Uses:  make(map[*ast.Ident]types.Object),
+			Types:     make(map[ast.Expr]types.TypeAndValue),
+			Defs:      make(map[*ast.Ident]types.Object),
+			Uses:      make(map[*ast.Ident]types.Object),
+			Implicits: make(map[ast.Node]types.Object),
 		},
 		recordTypeDone: make(map[*types.Named]bool),
 		fieldToStruct:  make(map[*types.Var]*types.Struct),
@@ -1687,48 +1687,88 @@ func recordedAsNotObfuscated(obj types.Object) bool {
 	return ok
 }
 
-func (tf *transformer) removeUnnecessaryImports(file *ast.File) {
-	usedImports := make(map[string]bool)
-	ast.Inspect(file, func(n ast.Node) bool {
-		node, ok := n.(*ast.Ident)
-		if !ok {
-			return true
+// isSafeForInstanceType returns true if the passed type is safe for var declaration.
+// Unsafe types: generic types and non-method interfaces.
+func isSafeForInstanceType(typ types.Type) bool {
+	switch t := typ.(type) {
+	case *types.Named:
+		if t.TypeParams().Len() > 0 {
+			return false
 		}
+		return isSafeForInstanceType(t.Underlying())
+	case *types.Signature:
+		return t.TypeParams().Len() == 0
+	case *types.Interface:
+		return t.IsMethodSet()
+	}
+	return true
+}
 
-		uses, ok := tf.info.Uses[node]
-		if !ok {
-			return true
-		}
-
-		if pkg := uses.Pkg(); pkg != nil {
-			usedImports[pkg.Path()] = true
-		}
-
-		return true
-	})
-
+func (tf *transformer) useAllImports(file *ast.File) {
 	for _, imp := range file.Imports {
 		if imp.Name != nil && imp.Name.Name == "_" {
 			continue
 		}
 
-		path, err := strconv.Unquote(imp.Path.Value)
-		if err != nil {
-			panic(err)
+		// Simple import has no ast.Ident and is stored in Implicits separately.
+		pkgObj := tf.info.Implicits[imp]
+		if pkgObj == nil {
+			pkgObj = tf.info.Defs[imp.Name] // renamed or dot import
 		}
 
-		// The import path can't be used directly here, because the actual
-		// path resolved via go/types might be different from the naive path.
-		lpkg, err := listPackage(path)
-		if err != nil {
-			panic(err)
+		pkgScope := pkgObj.(*types.PkgName).Imported().Scope()
+		var nameObj types.Object
+		for _, name := range pkgScope.Names() {
+			if obj := pkgScope.Lookup(name); obj.Exported() && isSafeForInstanceType(obj.Type()) {
+				nameObj = obj
+				break
+			}
 		}
-
-		if usedImports[lpkg.ImportPath] {
+		if nameObj == nil {
+			// A very unlikely situation where there is no suitable declaration for a reference variable
+			// and almost certainly means that there is another import reference in code.
 			continue
 		}
+		spec := &ast.ValueSpec{Names: []*ast.Ident{ast.NewIdent("_")}}
+		decl := &ast.GenDecl{Specs: []ast.Spec{spec}}
 
-		imp.Name = ast.NewIdent("_")
+		nameIdent := ast.NewIdent(nameObj.Name())
+		var nameExpr ast.Expr
+		switch {
+		case imp.Name == nil: // import "pkg/path"
+			nameExpr = &ast.SelectorExpr{
+				X:   ast.NewIdent(pkgObj.Name()),
+				Sel: nameIdent,
+			}
+		case imp.Name.Name != ".": // import path2 "pkg/path"
+			nameExpr = &ast.SelectorExpr{
+				X:   ast.NewIdent(imp.Name.Name),
+				Sel: nameIdent,
+			}
+		default: // import . "pkg/path"
+			nameExpr = nameIdent
+		}
+
+		switch nameObj.(type) {
+		case *types.Const:
+			// const _ = <value>
+			decl.Tok = token.CONST
+			spec.Values = []ast.Expr{nameExpr}
+		case *types.Var, *types.Func:
+			// var _ = <value>
+			decl.Tok = token.VAR
+			spec.Values = []ast.Expr{nameExpr}
+		case *types.TypeName:
+			// var _ <type>
+			decl.Tok = token.VAR
+			spec.Type = nameExpr
+		default:
+			continue // skip *types.Builtin and others
+		}
+
+		// Ensure that types.Info.Uses is up to date.
+		tf.info.Uses[nameIdent] = nameObj
+		file.Decls = append(file.Decls, decl)
 	}
 }
 
@@ -1744,7 +1784,7 @@ func (tf *transformer) transformGoFile(file *ast.File) *ast.File {
 		file = literals.Obfuscate(obfRand, file, tf.info, tf.linkerVariableStrings)
 
 		// some imported constants might not be needed anymore, remove unnecessary imports
-		tf.removeUnnecessaryImports(file)
+		tf.useAllImports(file)
 	}
 
 	pre := func(cursor *astutil.Cursor) bool {
