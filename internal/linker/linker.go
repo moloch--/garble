@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 
 	"github.com/bluekeyes/go-gitdiff/gitdiff"
@@ -119,10 +120,21 @@ func applyPatches(srcDir, workingDir string, modFiles map[string]bool, patches [
 		}
 	}
 
-	cmd := exec.Command("git", "-C", workingDir, "apply")
+	// If one of parent folders of workingDir contains repository, set current directory is not enough because git
+	// by default treats workingDir as a subfolder of repository, so it will break git apply. Adding --git-dir flag blocks this behavior.
+	cmd := exec.Command("git", "--git-dir", workingDir, "apply", "--verbose")
+	cmd.Dir = workingDir
 	cmd.Stdin = bytes.NewReader(bytes.Join(patches, []byte("\n")))
-	if err := cmd.Run(); err != nil {
+	out, err := cmd.CombinedOutput()
+	if err != nil {
 		return nil, err
+	}
+
+	// Running git without errors does not guarantee that all patches have been applied.
+	// Make sure that all passed patches have been applied correctly.
+	rx := regexp.MustCompile(`(?m)^Applied patch .+ cleanly\.$`)
+	if appliedPatches := len(rx.FindAllIndex(out, -1)); appliedPatches != len(patches) {
+		return nil, fmt.Errorf("expected %d applied patches, actually %d:\n\n%s", len(patches), appliedPatches, string(out))
 	}
 	return mod, nil
 }
@@ -187,6 +199,8 @@ func buildLinker(workingDir string, overlay map[string]string, outputLinkPath st
 	cmd := exec.Command("go", "build", "-overlay", overlayPath, "-o", outputLinkPath, "cmd/link")
 	// Explicitly setting GOOS and GOARCH variables prevents conflicts during cross-build
 	cmd.Env = append(os.Environ(), "GOOS="+runtime.GOOS, "GOARCH="+runtime.GOARCH)
+	// Building cmd/link is possible from anywhere, but to avoid any possible side effects build in a temp directory
+	cmd.Dir = workingDir
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
