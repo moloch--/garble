@@ -61,7 +61,9 @@ func TestScript(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	userCacheDir, err := os.UserCacheDir()
+	tempCacheDir := t.TempDir()
+
+	hostCacheDir, err := os.UserCacheDir()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,38 +71,36 @@ func TestScript(t *testing.T) {
 	p := testscript.Params{
 		Dir: filepath.Join("testdata", "script"),
 		Setup: func(env *testscript.Env) error {
-			env.Vars = append(env.Vars,
-				// Use testdata/mod as our module proxy.
-				"GOPROXY="+proxyURL,
+			// Use testdata/mod as our module proxy.
+			env.Setenv("GOPROXY", proxyURL)
 
-				// We use our own proxy, so avoid sum.golang.org.
-				"GONOSUMDB=*",
+			// We use our own proxy, so avoid sum.golang.org.
+			env.Setenv("GONOSUMDB", "*")
 
-				// "go build" starts many short-lived Go processes,
-				// such as asm, buildid, compile, and link.
-				// They don't allocate huge amounts of memory,
-				// and they'll exit within seconds,
-				// so using the GC is basically a waste of CPU.
-				// Turn it off entirely, releasing memory on exit.
-				//
-				// We don't want this setting always on,
-				// as it could result in memory problems for users.
-				// But it helps for our test suite,
-				// as the packages are relatively small.
-				"GOGC=off",
+			// "go build" starts many short-lived Go processes,
+			// such as asm, buildid, compile, and link.
+			// They don't allocate huge amounts of memory,
+			// and they'll exit within seconds,
+			// so using the GC is basically a waste of CPU.
+			// Turn it off entirely, releasing memory on exit.
+			//
+			// We don't want this setting always on,
+			// as it could result in memory problems for users.
+			// But it helps for our test suite,
+			// as the packages are relatively small.
+			env.Setenv("GOGC", "off")
 
-				"gofullversion="+runtime.Version(),
-				"EXEC_PATH="+execPath,
-				"GARBLE_CACHE_DIR="+userCacheDir,
-			)
+			env.Setenv("gofullversion", runtime.Version())
+			env.Setenv("EXEC_PATH", execPath)
 
-			if os.Getenv("TESTSCRIPT_COVER_DIR") != "" {
-				// Don't reuse the build cache if we want to collect
-				// code coverage. Otherwise, many toolexec calls would
-				// be avoided and the coverage would be incomplete.
-				// TODO: to not make "go test" insanely slow, we could still use
-				// an empty GOCACHE, but share it between all the test scripts.
-				env.Vars = append(env.Vars, "GOCACHE="+filepath.Join(env.WorkDir, "go-cache-tmp"))
+			if os.Getenv("GOCOVERDIR") != "" {
+				// Don't share cache dirs with the host if we want to collect code
+				// coverage. Otherwise, the coverage info might be incomplete.
+				env.Setenv("GOCACHE", filepath.Join(tempCacheDir, "go-cache"))
+				env.Setenv("GARBLE_CACHE_DIR", filepath.Join(tempCacheDir, "garble-cache"))
+			} else {
+				// GOCACHE is initialized by gotooltest to use the host's cache.
+				env.Setenv("GARBLE_CACHE_DIR", hostCacheDir)
 			}
 			return nil
 		},
@@ -315,8 +315,6 @@ func grepfiles(ts *testscript.TestScript, neg bool, args []string) {
 	anyFound := false
 	path, pattern := args[0], args[1]
 	rx := regexp.MustCompile(pattern)
-	// TODO: use fs.SkipAll in Go 1.20 and later.
-	errSkipAll := fmt.Errorf("sentinel error: stop walking")
 	if err := filepath.WalkDir(path, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -326,11 +324,11 @@ func grepfiles(ts *testscript.TestScript, neg bool, args []string) {
 				return fmt.Errorf("%q matches %q", path, pattern)
 			} else {
 				anyFound = true
-				return errSkipAll
+				return fs.SkipAll
 			}
 		}
 		return nil
-	}); err != nil && err != errSkipAll {
+	}); err != nil {
 		ts.Fatalf("%s", err)
 	}
 	if !neg && !anyFound {

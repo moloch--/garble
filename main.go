@@ -262,7 +262,7 @@ var toolchainVersionSemver string
 
 func goVersionOK() bool {
 	const (
-		minGoVersionSemver = "v1.19.0"
+		minGoVersionSemver = "v1.20.0"
 		suggestedGoVersion = "1.20.x"
 	)
 
@@ -354,7 +354,7 @@ func mainErr(args []string) error {
 
 		// Until https://github.com/golang/go/issues/50603 is implemented,
 		// manually construct something like a pseudo-version.
-		// TODO: remove when this code is dead, hopefully in Go 1.20.
+		// TODO: remove when this code is dead, hopefully in Go 1.21.
 		if mod.Version == "(devel)" {
 			var vcsTime time.Time
 			var vcsRevision string
@@ -449,6 +449,7 @@ func mainErr(args []string) error {
 
 			executablePath = modifiedLinkPath
 			os.Setenv(linker.MagicValueEnv, strconv.FormatUint(uint64(magicValue()), 10))
+			os.Setenv(linker.EntryOffKeyEnv, strconv.FormatUint(uint64(entryOffKey()), 10))
 			if flagTiny {
 				os.Setenv(linker.TinyEnv, "true")
 			}
@@ -794,15 +795,8 @@ func replaceAsmNames(buf *bytes.Buffer, remaining []byte) {
 		// If the name was qualified, fetch the package, and write the
 		// obfuscated import path if needed.
 		// Note that we don't obfuscate the package path "main".
-		//
-		// Note that runtime/internal/startlinetest refers to runtime_test in
-		// one of its assembly files, and we currently do not always collect
-		// test packages in appendListedPackages for the sake of performance.
-		// We don't care about testing the runtime just yet, so work around it.
-		// TODO(mvdan): this runtime_test reference was removed in Go 1.20 per
-		// https://github.com/golang/go/issues/57334; remove at a later time.
 		lpkg := curPkg
-		if asmPkgPath != "" && asmPkgPath != "main" && asmPkgPath != "runtime_test" {
+		if asmPkgPath != "" && asmPkgPath != "main" {
 			if asmPkgPath != curPkg.Name {
 				goPkgPath := asmPkgPath
 				goPkgPath = strings.ReplaceAll(goPkgPath, string(asmPeriod), string(goPeriod))
@@ -955,6 +949,7 @@ func transformCompile(args []string) ([]string, error) {
 			}
 			if basename == "symtab.go" {
 				updateMagicValue(file, magicValue())
+				updateEntryOffset(file, entryOffKey())
 			}
 		}
 		tf.handleDirectives(file.Comments)
@@ -1223,7 +1218,7 @@ func processImportCfg(flags []string) (newImportCfg string, _ error) {
 			// See exporttest/*.go in testdata/scripts/test.txt.
 			// For now, spot the pattern and avoid the unnecessary error;
 			// the dependency is unused, so the packagefile line is redundant.
-			// This still triggers as of go1.19beta1.
+			// This still triggers as of go1.20.
 			if strings.HasSuffix(curPkg.ImportPath, ".test]") && strings.HasPrefix(curPkg.ImportPath, impPath) {
 				continue
 			}
@@ -1939,12 +1934,6 @@ func (tf *transformer) transformGoFile(file *ast.File) *ast.File {
 
 		// The package that declared this object did not obfuscate it.
 		if recordedAsNotObfuscated(obj) {
-			return true
-		}
-
-		// TODO(mvdan): investigate obfuscating these too.
-		filename := fset.Position(obj.Pos()).Filename
-		if strings.HasPrefix(filename, "_cgo_") || strings.Contains(filename, ".cgo1.") {
 			return true
 		}
 
