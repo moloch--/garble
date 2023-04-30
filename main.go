@@ -78,6 +78,8 @@ func (f seedFlag) String() string {
 
 func (f *seedFlag) Set(s string) error {
 	if s == "random" {
+		f.random = true // to show the random seed we chose
+
 		f.bytes = make([]byte, 16) // random 128 bit seed
 		if _, err := cryptorand.Read(f.bytes); err != nil {
 			return fmt.Errorf("error generating random seed: %v", err)
@@ -119,6 +121,7 @@ The following commands are supported:
 
 	build          replace "go build"
 	test           replace "go test"
+	run            replace "go run"
 	reverse        de-obfuscate output such as stack traces
 	version        print the version and build settings of the garble binary
 
@@ -234,18 +237,20 @@ func main1() int {
 		usage()
 		return 2
 	}
+
+	// If a random seed was used, the user won't be able to reproduce the
+	// same output or failure unless we print the random seed we chose.
+	// If the build failed and a random seed was used,
+	// the failure might not reproduce with a different seed.
+	// Print it before we exit.
+	if flagSeed.random {
+		fmt.Fprintf(os.Stderr, "-seed chosen at random: %s\n", base64.RawStdEncoding.EncodeToString(flagSeed.bytes))
+	}
 	if err := mainErr(args); err != nil {
 		if code, ok := err.(errJustExit); ok {
 			return int(code)
 		}
 		fmt.Fprintln(os.Stderr, err)
-
-		// If the build failed and a random seed was used,
-		// the failure might not reproduce with a different seed.
-		// Print it before we exit.
-		if flagSeed.random {
-			fmt.Fprintf(os.Stderr, "random seed: %s\n", base64.RawStdEncoding.EncodeToString(flagSeed.bytes))
-		}
 		return 1
 	}
 	return 0
@@ -254,11 +259,6 @@ func main1() int {
 type errJustExit int
 
 func (e errJustExit) Error() string { return fmt.Sprintf("exit: %d", e) }
-
-// toolchainVersionSemver is a semver-compatible version of the Go toolchain currently
-// being used, as reported by "go env GOVERSION".
-// Note that the version of Go that built the garble binary might be newer.
-var toolchainVersionSemver string
 
 func goVersionOK() bool {
 	const (
@@ -270,7 +270,7 @@ func goVersionOK() bool {
 	rxVersion := regexp.MustCompile(`go\d+\.\d+(?:\.\d+)?`)
 
 	toolchainVersionFull := cache.GoEnv.GOVERSION
-	toolchainVersion := rxVersion.FindString(cache.GoEnv.GOVERSION)
+	toolchainVersion := rxVersion.FindString(toolchainVersionFull)
 	if toolchainVersion == "" {
 		// Go 1.15.x and older do not have GOVERSION yet.
 		// We could go the extra mile and fetch it via 'go toolchainVersion',
@@ -279,14 +279,14 @@ func goVersionOK() bool {
 		return false
 	}
 
-	toolchainVersionSemver = "v" + strings.TrimPrefix(toolchainVersion, "go")
-	if semver.Compare(toolchainVersionSemver, minGoVersionSemver) < 0 {
+	cache.GoVersionSemver = "v" + strings.TrimPrefix(toolchainVersion, "go")
+	if semver.Compare(cache.GoVersionSemver, minGoVersionSemver) < 0 {
 		fmt.Fprintf(os.Stderr, "Go version %q is too old; please upgrade to Go %s or newer\n", toolchainVersionFull, suggestedGoVersion)
 		return false
 	}
 
 	// Ensure that the version of Go that built the garble binary is equal or
-	// newer than toolchainVersionSemver.
+	// newer than cache.GoVersionSemver.
 	builtVersionFull := os.Getenv("GARBLE_TEST_GOVERSION")
 	if builtVersionFull == "" {
 		builtVersionFull = runtime.Version()
@@ -298,7 +298,7 @@ func goVersionOK() bool {
 		return true
 	}
 	builtVersionSemver := "v" + strings.TrimPrefix(builtVersion, "go")
-	if semver.Compare(builtVersionSemver, toolchainVersionSemver) < 0 {
+	if semver.Compare(builtVersionSemver, cache.GoVersionSemver) < 0 {
 		fmt.Fprintf(os.Stderr, "garble was built with %q and is being used with %q; please rebuild garble with the newer version\n",
 			builtVersionFull, toolchainVersionFull)
 		return false
@@ -392,7 +392,7 @@ func mainErr(args []string) error {
 		return nil
 	case "reverse":
 		return commandReverse(args)
-	case "build", "test":
+	case "build", "test", "run":
 		cmd, err := toolexecCmd(command, args)
 		defer os.RemoveAll(os.Getenv("GARBLE_SHARED"))
 		if err != nil {
@@ -441,7 +441,7 @@ func mainErr(args []string) error {
 
 		executablePath := args[0]
 		if tool == "link" {
-			modifiedLinkPath, unlock, err := linker.PatchLinker(cache.GoEnv.GOROOT, cache.GoEnv.GOVERSION, cache.GoEnv.GOEXE, sharedTempDir)
+			modifiedLinkPath, unlock, err := linker.PatchLinker(cache.GoEnv.GOROOT, cache.GoEnv.GOVERSION, sharedTempDir)
 			if err != nil {
 				return fmt.Errorf("cannot get modified linker: %v", err)
 			}
@@ -1907,6 +1907,10 @@ func (tf *transformer) transformGoFile(file *ast.File) *ast.File {
 		// match any field or method named FS.
 		path := pkg.Path()
 		switch path {
+		case "sync/atomic", "runtime/internal/atomic":
+			if name == "align64" {
+				return true
+			}
 		case "embed":
 			// FS is detected by the compiler for //go:embed.
 			// TODO: We probably want a conditional, otherwise we're not
@@ -2378,7 +2382,7 @@ func flagSetValue(flags []string, name, value string) []string {
 func fetchGoEnv() error {
 	out, err := exec.Command("go", "env", "-json",
 		// Keep in sync with sharedCache.GoEnv.
-		"GOOS", "GOMOD", "GOVERSION", "GOROOT", "GOEXE",
+		"GOOS", "GOMOD", "GOVERSION", "GOROOT",
 	).CombinedOutput()
 	if err != nil {
 		// TODO: cover this in the tests.

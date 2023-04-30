@@ -11,11 +11,14 @@ on:
 # as it runs many builds under the hood.
 # The default -timeout=10m can be hit by the hosted runners.
 #
-# Also note that we don't use actions/cache for Go on purpose.
+# Also note that we don't use Actions caching for Go on purpose.
 # Caching GOMODCACHE wouldn't help much, as we have few deps.
 # Caching GOCACHE would do more harm than good,
 # as the tests redo most of their work if the garble version changes,
 # and the majority of commits or PRs will do so.
+# Moreover, GitHub saves and restores caches via compressed archives over the
+# network, which means it can easily add one minute of overhead on its own for
+# just a few hundred megabytes worth of files.
 
 name: Test
 jobs:
@@ -27,25 +30,29 @@ jobs:
         os: [ubuntu-latest, macos-11, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/setup-go@v3
+    - uses: actions/checkout@v3
+    - uses: actions/setup-go@v4
       with:
         go-version: ${{ matrix.go-version }}
-    - uses: actions/checkout@v3
-    - name: Test
+        cache: false
+    # linux already runs the tests with -race below, plus extra checks,
+    # so skip the regular tests to prevent it from taking the longest.
+    - if: matrix.os != 'ubuntu-latest'
       run: go test -timeout=15m ./...
+    # macos and windows failures with bincmp can be hard to reproduce locally,
+    # so upload the binaries as artifacts.
     - uses: actions/upload-artifact@v3
       if: failure()
       with:
         name: bincmp_output
         path: bincmp_output/
-    - name: Test with -race
-      # macos and windows tend to be a bit slower,
-      # and it's rare that a race in garble would be OS-specific.
-      if: matrix.os == 'ubuntu-latest'
+    # macos and windows tend to be a bit slower,
+    # and it's rare that a race in garble would be OS-specific.
+    - if: matrix.os == 'ubuntu-latest'
       run: go test -race -timeout=20m ./...
 
     # Static checks from this point forward. Only run on one Go version and on
-    # Linux, since it's the fastest platform, and the tools behave the same.
+    # linux, since it's the fastest platform, and the tools behave the same.
     - name: Test third-party project builds
       if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.20.x'
       run: |
@@ -60,7 +67,7 @@ jobs:
     - if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.20.x'
       uses: dominikh/staticcheck-action@v1
       with:
-        version: "2023.1.2"
+        version: "2023.1.3"
         install-go: false
 
   # We don't care about GOARCH=386 particularly,
@@ -84,7 +91,7 @@ jobs:
     steps:
     - name: Install Go
       env:
-        GO_COMMIT: ffb07d0c66db2f3f33faedf2927f9aa476d47720 # 2023-02-25
+        GO_COMMIT: 0fd6ae548f550bdbee4a434285ff052fb9dc7417 # 2023-04-28
       run: |
         cd $HOME
         mkdir $HOME/gotip

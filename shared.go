@@ -46,6 +46,13 @@ type sharedCache struct {
 
 	GOGARBLE string
 
+	// GoVersionSemver is a semver-compatible version of the Go toolchain
+	// currently being used, as reported by "go env GOVERSION".
+	// Note that the version of Go that built the garble binary might be newer.
+	// Also note that a devel version like "go1.21-231f290e51" is
+	// currently represented as "v1.21".
+	GoVersionSemver string
+
 	// Filled directly from "go env".
 	// Keep in sync with fetchGoEnv.
 	GoEnv struct {
@@ -54,7 +61,6 @@ type sharedCache struct {
 		GOMOD     string
 		GOVERSION string
 		GOROOT    string
-		GOEXE     string
 	}
 }
 
@@ -148,7 +154,7 @@ type listedPackage struct {
 	Imports         []string
 
 	Incomplete bool
-	// These two exist only to fill Incomplete.
+	// These two exist to report package loading errors to the user.
 	Error      *packageError
 	DepsErrors []*packageError
 
@@ -257,30 +263,46 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 
 		// Sometimes cmd/go sets Error without setting Incomplete per the docs.
 		// TODO: remove the workaround once https://go.dev/issue/57724 is fixed.
-		if (pkg.Error != nil || pkg.DepsErrors != nil) && !pkg.Incomplete {
+		if pkg.Error != nil || pkg.DepsErrors != nil {
 			pkg.Incomplete = true
 		}
 
-		if pkg.Incomplete {
+		if perr := pkg.Error; perr != nil {
 			switch {
 			// All errors in non-std packages are fatal,
 			// but only some errors in std packages are.
 			case strings.Contains(pkg.ImportPath, "."):
 				fallthrough
 			default:
-				pkgErrors = append(pkgErrors, pkg.Error.Err)
-				continue
+				// Error messages sometimes include a trailing newline.
+				pkgErrors = append(pkgErrors, strings.TrimSpace(perr.Err))
 
 			// Some packages in runtimeLinknamed are OS-specific,
 			// like crypto/internal/boring/fipstls, so "no Go files"
 			// for the current OS can be ignored safely as an error.
-			case pkg.Standard && strings.Contains(pkg.Error.Err, "build constraints exclude all Go files"):
+			case pkg.Standard && strings.Contains(perr.Err, "build constraints exclude all Go files"):
 			// Some packages in runtimeLinknamed are recent,
 			// like "arena", so older Go versions that we support
 			// do not yet have them and that's OK.
 			// Note that pkg.Standard is false for them.
-			case strings.Contains(pkg.Error.Err, "is not in GOROOT"):
-			case strings.Contains(pkg.Error.Err, "cannot find package"):
+			case strings.Contains(perr.Err, "is not in GOROOT"):
+			case strings.Contains(perr.Err, "cannot find package"):
+			}
+		}
+		if len(pkg.DepsErrors) > 0 {
+			for i, derr := range pkg.DepsErrors {
+				// When an error in DepsErrors starts with a "# pkg/path" line,
+				// it's an error that we're already printing via that package's Error field.
+				// Otherwise, the error is that we couldn't find that package at all,
+				// so we do need to print it here as that package won't be listed.
+				if i == 0 {
+					if strings.HasPrefix(derr.Err, "# ") {
+						break
+					}
+					pkgErrors = append(pkgErrors, "# "+pkg.ImportPath)
+				}
+				// Error messages sometimes include a trailing newline.
+				pkgErrors = append(pkgErrors, strings.TrimSpace(derr.Err))
 			}
 		}
 
@@ -321,6 +343,7 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 			path == "runtime/cgo":
 
 		// We can't obfuscate packages which weren't loaded.
+		// This can happen since we ignore some pkg.Error messages above.
 		case pkg.Incomplete:
 
 		// No point in obfuscating empty packages.
