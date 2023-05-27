@@ -20,24 +20,35 @@ import (
 
 const buildIDSeparator = "/"
 
-// splitActionID returns the action ID half of a build ID, the first component.
+// splitActionID returns the action ID half of a build ID, the first hash.
 func splitActionID(buildID string) string {
 	return buildID[:strings.Index(buildID, buildIDSeparator)]
 }
 
-// splitContentID returns the content ID half of a build ID, the last component.
+// splitContentID returns the content ID half of a build ID, the last hash.
 func splitContentID(buildID string) string {
 	return buildID[strings.LastIndex(buildID, buildIDSeparator)+1:]
 }
 
-// decodeHash is the opposite of hashToString, with a panic for error handling
-// since it should never happen.
-func decodeHash(str string) []byte {
+// buildIDHashLength is the number of bytes each build ID hash takes,
+// such as an action ID or a content ID.
+const buildIDHashLength = 15
+
+// decodeBuildIDHash decodes a build ID hash in base64, just like cmd/go does.
+func decodeBuildIDHash(str string) []byte {
 	h, err := base64.RawURLEncoding.DecodeString(str)
 	if err != nil {
 		panic(fmt.Sprintf("invalid hash %q: %v", str, err))
 	}
+	if len(h) != buildIDHashLength {
+		panic(fmt.Sprintf("decodeHash expects to result in a hash of length %d, got %d", buildIDHashLength, len(h)))
+	}
 	return h
+}
+
+// encodeBuildIDHash encodes a build ID hash in base64, just like cmd/go does.
+func encodeBuildIDHash(h [sha256.Size]byte) string {
+	return base64.RawURLEncoding.EncodeToString(h[:buildIDHashLength])
 }
 
 func alterToolVersion(tool string, args []string) error {
@@ -57,7 +68,7 @@ func alterToolVersion(tool string, args []string) error {
 	var toolID []byte
 	if f[2] == "devel" {
 		// On the development branch, use the content ID part of the build ID.
-		toolID = decodeHash(splitContentID(f[len(f)-1]))
+		toolID = decodeBuildIDHash(splitContentID(f[len(f)-1]))
 	} else {
 		// For a release, the output is like: "compile version go1.9.1 X:framepointer".
 		// Use the whole line, as we can assume it's unique.
@@ -70,9 +81,9 @@ func alterToolVersion(tool string, args []string) error {
 	// the action (build) or not. Since cmd/go parses the last word in the
 	// output as "buildID=...", we simply add "+garble buildID=_/_/_/${hash}".
 	// The slashes let us imitate a full binary build ID, but we assume that
-	// the other components such as the action ID are not necessary, since the
+	// the other hashes such as the action ID are not necessary, since the
 	// only reader here is cmd/go and it only consumes the content ID.
-	fmt.Printf("%s +garble buildID=_/_/_/%s\n", line, hashToString(contentID))
+	fmt.Printf("%s +garble buildID=_/_/_/%s\n", line, encodeBuildIDHash(contentID))
 	return nil
 }
 
@@ -87,26 +98,27 @@ var (
 //
 // This includes garble's own version, obtained via its own binary's content ID,
 // as well as any other options which affect a build, such as GOGARBLE and -tiny.
-func addGarbleToHash(inputHash []byte) []byte {
+func addGarbleToHash(inputHash []byte) [sha256.Size]byte {
 	// Join the two content IDs together into a single base64-encoded sha256
 	// sum. This includes the original tool's content ID, and garble's own
 	// content ID.
 	hasher.Reset()
 	hasher.Write(inputHash)
-	if len(cache.BinaryContentID) == 0 {
+	if len(sharedCache.BinaryContentID) == 0 {
 		panic("missing binary content ID")
 	}
-	hasher.Write(cache.BinaryContentID)
+	hasher.Write(sharedCache.BinaryContentID)
 
 	// We also need to add the selected options to the full version string,
 	// because all of them result in different output. We use spaces to
 	// separate the env vars and flags, to reduce the chances of collisions.
-	fmt.Fprintf(hasher, " GOGARBLE=%s", cache.GOGARBLE)
+	fmt.Fprintf(hasher, " GOGARBLE=%s", sharedCache.GOGARBLE)
 	appendFlags(hasher, true)
 	// addGarbleToHash returns the sum buffer, so we need a new copy.
 	// Otherwise the next use of the global sumBuffer would conflict.
-	sumBuffer := make([]byte, 0, sha256.Size)
-	return hasher.Sum(sumBuffer)[:buildIDComponentLength]
+	var sumBuffer [sha256.Size]byte
+	hasher.Sum(sumBuffer[:0])
+	return sumBuffer
 }
 
 // appendFlags writes garble's own flags to w in string form.
@@ -151,16 +163,6 @@ func appendFlags(w io.Writer, forBuildHash bool) {
 	}
 }
 
-// buildIDComponentLength is the number of bytes each build ID component takes,
-// such as an action ID or a content ID.
-const buildIDComponentLength = 15
-
-// hashToString encodes the first 120 bits of a sha256 sum in base64, the same
-// format used for components in a build ID.
-func hashToString(h []byte) string {
-	return base64.RawURLEncoding.EncodeToString(h[:buildIDComponentLength])
-}
-
 func buildidOf(path string) (string, error) {
 	cmd := exec.Command("go", "tool", "buildid", path)
 	out, err := cmd.Output()
@@ -198,7 +200,7 @@ func toUpper(b byte) byte { return b - ('a' - 'A') }
 func runtimeHashWithCustomSalt(salt []byte) uint32 {
 	hasher.Reset()
 	if !flagSeed.present() {
-		hasher.Write(cache.ListedPackages["runtime"].GarbleActionID)
+		hasher.Write(sharedCache.ListedPackages["runtime"].GarbleActionID[:])
 	} else {
 		hasher.Write(flagSeed.bytes)
 	}
@@ -221,7 +223,7 @@ func entryOffKey() uint32 {
 
 func hashWithPackage(pkg *listedPackage, name string) string {
 	if !flagSeed.present() {
-		return hashWithCustomSalt(pkg.GarbleActionID, name)
+		return hashWithCustomSalt(pkg.GarbleActionID[:], name)
 	}
 	// Use a separator at the end of ImportPath as a salt,
 	// to ensure that "pkgfoo.bar" and "pkg.foobar" don't both hash
@@ -235,7 +237,8 @@ func hashWithStruct(strct *types.Struct, fieldName string) string {
 	// struct type "canonical"?
 	fieldsSalt := []byte(strct.String())
 	if !flagSeed.present() {
-		fieldsSalt = addGarbleToHash(fieldsSalt)
+		withGarbleHash := addGarbleToHash(fieldsSalt)
+		fieldsSalt = withGarbleHash[:]
 	}
 	return hashWithCustomSalt(fieldsSalt, fieldName)
 }

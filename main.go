@@ -270,7 +270,7 @@ func goVersionOK() bool {
 	// rxVersion looks for a version like "go1.2" or "go1.2.3"
 	rxVersion := regexp.MustCompile(`go\d+\.\d+(?:\.\d+)?`)
 
-	toolchainVersionFull := cache.GoEnv.GOVERSION
+	toolchainVersionFull := sharedCache.GoEnv.GOVERSION
 	toolchainVersion := rxVersion.FindString(toolchainVersionFull)
 	if toolchainVersion == "" {
 		// Go 1.15.x and older do not have GOVERSION yet.
@@ -280,8 +280,8 @@ func goVersionOK() bool {
 		return false
 	}
 
-	cache.GoVersionSemver = "v" + strings.TrimPrefix(toolchainVersion, "go")
-	if semver.Compare(cache.GoVersionSemver, minGoVersionSemver) < 0 {
+	sharedCache.GoVersionSemver = "v" + strings.TrimPrefix(toolchainVersion, "go")
+	if semver.Compare(sharedCache.GoVersionSemver, minGoVersionSemver) < 0 {
 		fmt.Fprintf(os.Stderr, "Go version %q is too old; please upgrade to Go %s or newer\n", toolchainVersionFull, suggestedGoVersion)
 		return false
 	}
@@ -299,9 +299,11 @@ func goVersionOK() bool {
 		return true
 	}
 	builtVersionSemver := "v" + strings.TrimPrefix(builtVersion, "go")
-	if semver.Compare(builtVersionSemver, cache.GoVersionSemver) < 0 {
-		fmt.Fprintf(os.Stderr, "garble was built with %q and is being used with %q; please rebuild garble with the newer version\n",
-			builtVersionFull, toolchainVersionFull)
+	if semver.Compare(builtVersionSemver, sharedCache.GoVersionSemver) < 0 {
+		fmt.Fprintf(os.Stderr, `
+garble was built with %q and is being used with %q; rebuild it with a command like:
+    garble install mvdan.cc/garble@latest
+`[1:], builtVersionFull, toolchainVersionFull)
 		return false
 	}
 
@@ -426,7 +428,7 @@ func mainErr(args []string) error {
 			}
 
 			toolexecImportPath := os.Getenv("TOOLEXEC_IMPORTPATH")
-			curPkg = cache.ListedPackages[toolexecImportPath]
+			curPkg = sharedCache.ListedPackages[toolexecImportPath]
 			if curPkg == nil {
 				return fmt.Errorf("TOOLEXEC_IMPORTPATH not found in listed packages: %s", toolexecImportPath)
 			}
@@ -442,7 +444,7 @@ func mainErr(args []string) error {
 
 		executablePath := args[0]
 		if tool == "link" {
-			modifiedLinkPath, unlock, err := linker.PatchLinker(cache.GoEnv.GOROOT, cache.GoEnv.GOVERSION, sharedTempDir)
+			modifiedLinkPath, unlock, err := linker.PatchLinker(sharedCache.GoEnv.GOROOT, sharedCache.GoEnv.GOVERSION, sharedTempDir)
 			if err != nil {
 				return fmt.Errorf("cannot get modified linker: %v", err)
 			}
@@ -507,13 +509,13 @@ This command wraps "go %s". Below is its help:
 
 	// Here is the only place we initialize the cache.
 	// The sub-processes will parse it from a shared gob file.
-	cache = &sharedCache{}
+	sharedCache = &sharedCacheType{}
 
 	// Note that we also need to pass build flags to 'go list', such
 	// as -tags.
-	cache.ForwardBuildFlags, _ = filterForwardBuildFlags(flags)
+	sharedCache.ForwardBuildFlags, _ = filterForwardBuildFlags(flags)
 	if command == "test" {
-		cache.ForwardBuildFlags = append(cache.ForwardBuildFlags, "-test")
+		sharedCache.ForwardBuildFlags = append(sharedCache.ForwardBuildFlags, "-test")
 	}
 
 	if err := fetchGoEnv(); err != nil {
@@ -525,16 +527,16 @@ This command wraps "go %s". Below is its help:
 	}
 
 	var err error
-	cache.ExecPath, err = os.Executable()
+	sharedCache.ExecPath, err = os.Executable()
 	if err != nil {
 		return nil, err
 	}
 
-	binaryBuildID, err := buildidOf(cache.ExecPath)
+	binaryBuildID, err := buildidOf(sharedCache.ExecPath)
 	if err != nil {
 		return nil, err
 	}
-	cache.BinaryContentID = decodeHash(splitContentID(binaryBuildID))
+	sharedCache.BinaryContentID = decodeBuildIDHash(splitContentID(binaryBuildID))
 
 	if err := appendListedPackages(args, true); err != nil {
 		return nil, err
@@ -576,7 +578,7 @@ This command wraps "go %s". Below is its help:
 	// We can add extra flags to the end of the same -toolexec argument.
 	var toolexecFlag strings.Builder
 	toolexecFlag.WriteString("-toolexec=")
-	quotedExecPath, err := cmdgoQuotedJoin([]string{cache.ExecPath})
+	quotedExecPath, err := cmdgoQuotedJoin([]string{sharedCache.ExecPath})
 	if err != nil {
 		// Can only happen if the absolute path to the garble binary contains
 		// both single and double quotes. Seems extremely unlikely.
@@ -892,56 +894,69 @@ func transformCompile(args []string) ([]string, error) {
 		files = append(files, file)
 	}
 	tf := newTransformer()
-	if err := tf.typecheck(files); err != nil {
-		return nil, err
-	}
 
-	flags = alterTrimpath(flags)
-
+	// cachedOutput is modified starting at this point, with the typecheck call.
+	// We use an extra syntax block to clarify what bits of code set up the caching.
 	// Note that if the file already exists in the cache from another build,
 	// we don't need to write to it again thanks to the hash.
 	// TODO: as an optimization, just load that one gob file.
-	if err := loadCachedOutputs(); err != nil {
-		return nil, err
-	}
+	{
+		if err := loadCachedOutputs(); err != nil {
+			return nil, err
+		}
 
-	ssaProg := ssa.NewProgram(fset, 0)
+		if err := tf.typecheck(files); err != nil {
+			return nil, err
+		}
 
-	// Create SSA packages for all imports.
-	// Order is not significant.
-	created := make(map[*types.Package]bool)
-	var createAll func(pkgs []*types.Package)
-	createAll = func(pkgs []*types.Package) {
-		for _, p := range pkgs {
-			if !created[p] {
-				created[p] = true
-				ssaProg.CreatePackage(p, nil, nil, true)
-				createAll(p.Imports())
+		ssaProg := ssa.NewProgram(fset, 0)
+
+		// Create SSA packages for all imports.
+		// Order is not significant.
+		created := make(map[*types.Package]bool)
+		var createAll func(pkgs []*types.Package)
+		createAll = func(pkgs []*types.Package) {
+			for _, p := range pkgs {
+				if !created[p] {
+					created[p] = true
+					ssaProg.CreatePackage(p, nil, nil, true)
+					createAll(p.Imports())
+				}
 			}
 		}
+		createAll(tf.pkg.Imports())
+
+		ssaPkg := ssaProg.CreatePackage(tf.pkg, files, tf.info, false)
+		ssaPkg.Build()
+
+		tf.recordReflection(ssaPkg)
+
+		if err := tf.prefillObjectMaps(files); err != nil {
+			return nil, err
+		}
+
+		if err := writeGobExclusive(
+			garbleExportFile(curPkg),
+			cachedOutput,
+		); err != nil && !errors.Is(err, fs.ErrExist) {
+			return nil, err
+		}
 	}
-	createAll(tf.pkg.Imports())
+	// cachedOutput isn't modified after this point.
 
-	ssaPkg := ssaProg.CreatePackage(tf.pkg, files, tf.info, false)
-	ssaPkg.Build()
-
-	tf.recordReflection(ssaPkg)
+	flags = alterTrimpath(flags)
 	newImportCfg, err := processImportCfg(flags)
 	if err != nil {
 		return nil, err
 	}
 
 	// Literal obfuscation uses math/rand, so seed it deterministically.
-	randSeed := curPkg.GarbleActionID
+	randSeed := curPkg.GarbleActionID[:]
 	if flagSeed.present() {
 		randSeed = flagSeed.bytes
 	}
 	// log.Printf("seeding math/rand with %x\n", randSeed)
 	obfRand = mathrand.New(mathrand.NewSource(int64(binary.BigEndian.Uint64(randSeed))))
-
-	if err := tf.prefillObjectMaps(files); err != nil {
-		return nil, err
-	}
 
 	// If this is a package to obfuscate, swap the -p flag with the new package path.
 	// We don't if it's the main package, as that just uses "-p main".
@@ -1000,7 +1015,7 @@ func transformCompile(args []string) ([]string, error) {
 		// as we end up with extra near-duplicate cached artifacts.
 		if i == 0 {
 			src = append(src, fmt.Sprintf(
-				"\nvar garbleActionID = %q\n", hashToString(curPkg.GarbleActionID),
+				"\nvar garbleActionID = %q\n", encodeBuildIDHash(curPkg.GarbleActionID),
 			)...)
 		}
 
@@ -1013,13 +1028,6 @@ func transformCompile(args []string) ([]string, error) {
 		}
 	}
 	flags = flagSetValue(flags, "-importcfg", newImportCfg)
-
-	if err := writeGobExclusive(
-		garbleExportFile(curPkg),
-		cachedOutput,
-	); err != nil && !errors.Is(err, fs.ErrExist) {
-		return nil, err
-	}
 
 	return append(flags, newPaths...), nil
 }
@@ -1323,7 +1331,7 @@ func garbleExportFile(pkg *listedPackage) string {
 	if trimmed == pkg.Export {
 		panic(fmt.Sprintf("unexpected export path of %s: %q", pkg.ImportPath, pkg.Export))
 	}
-	return trimmed + "-garble-" + hashToString(pkg.GarbleActionID) + "-d"
+	return trimmed + "-garble-" + encodeBuildIDHash(pkg.GarbleActionID) + "-d"
 }
 
 func loadCachedOutputs() error {
@@ -1386,7 +1394,7 @@ func (tf *transformer) prefillObjectMaps(files []*ast.File) error {
 	// If we do confirm this theoretical bug,
 	// the solution will be to either find a different solution for -literals,
 	// or to force including -ldflags into the build cache key.
-	ldflags, err := cmdgoQuotedSplit(flagValue(cache.ForwardBuildFlags, "-ldflags"))
+	ldflags, err := cmdgoQuotedSplit(flagValue(sharedCache.ForwardBuildFlags, "-ldflags"))
 	if err != nil {
 		return err
 	}
@@ -1945,7 +1953,7 @@ func transformLink(args []string) ([]string, error) {
 		// Otherwise, find it in the cache.
 		lpkg := curPkg
 		if path != "main" {
-			lpkg = cache.ListedPackages[path]
+			lpkg = sharedCache.ListedPackages[path]
 		}
 		if lpkg == nil {
 			// We couldn't find the package.
@@ -2183,12 +2191,12 @@ To install Go, see: https://go.dev/doc/install
 `, err)
 		return errJustExit(1)
 	}
-	if err := json.Unmarshal(out, &cache.GoEnv); err != nil {
+	if err := json.Unmarshal(out, &sharedCache.GoEnv); err != nil {
 		return fmt.Errorf(`cannot unmarshal from "go env -json": %w`, err)
 	}
-	cache.GOGARBLE = os.Getenv("GOGARBLE")
-	if cache.GOGARBLE == "" {
-		cache.GOGARBLE = "*" // we default to obfuscating everything
+	sharedCache.GOGARBLE = os.Getenv("GOGARBLE")
+	if sharedCache.GOGARBLE == "" {
+		sharedCache.GOGARBLE = "*" // we default to obfuscating everything
 	}
 	return nil
 }
