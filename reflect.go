@@ -407,32 +407,32 @@ func (ri *reflectInspector) recursivelyRecordUsedForReflect(t types.Type) {
 // if that shows an improvement in our benchmark
 func recordedObjectString(obj types.Object) objectString {
 	pkg := obj.Pkg()
-	if obj, ok := obj.(*types.Var); ok && obj.IsField() {
-		// For exported fields, "pkgpath.Field" is not unique,
-		// because two exported top-level types could share "Field".
-		//
-		// Moreover, note that not all fields belong to named struct types;
-		// an API could be exposing:
-		//
-		//   var usedInReflection = struct{Field string}
-		//
-		// For now, a hack: assume that packages don't declare the same field
-		// more than once in the same line. This works in practice, but one
-		// could craft Go code to break this assumption.
-		// Also note that the compiler's object files include filenames and line
-		// numbers, but not column numbers nor byte offsets.
-		// TODO(mvdan): give this another think, and add tests involving anon types.
+	// Names which are not at the package level still need to avoid obfuscation in some cases:
+	//
+	// 1. Field names on global types, which can be reached via reflection.
+	// 2. Field names on anonymous types can also be reached via reflection.
+	// 3. Local named types can be embedded in a local struct, becoming a field name as well.
+	//
+	// For now, a hack: assume that packages don't declare the same field
+	// more than once in the same line. This works in practice, but one
+	// could craft Go code to break this assumption.
+	// Also note that the compiler's object files include filenames and line
+	// numbers, but not column numbers nor byte offsets.
+	if pkg.Scope() != obj.Parent() {
+		switch obj := obj.(type) {
+		case *types.Var: // struct fields; cases 1 and 2 above
+			if !obj.IsField() {
+				return "" // local variables don't need to be recorded
+			}
+		case *types.TypeName: // local named types; case 3 above
+		default:
+			return "" // other objects (labels, consts, etc) don't need to be recorded
+		}
 		pos := fset.Position(obj.Pos())
 		return fmt.Sprintf("%s.%s - %s:%d", pkg.Path(), obj.Name(),
 			filepath.Base(pos.Filename), pos.Line)
 	}
-	// Names which are not at the top level cannot be imported,
-	// so we don't need to record them either.
-	// Note that this doesn't apply to fields, which are never top-level.
-	if pkg.Scope() != obj.Parent() {
-		return ""
-	}
-	// For top-level exported names, "pkgpath.Name" is unique.
+	// For top-level names, "pkgpath.Name" is unique.
 	return pkg.Path() + "." + obj.Name()
 }
 
