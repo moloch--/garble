@@ -268,7 +268,7 @@ func (e errJustExit) Error() string { return fmt.Sprintf("exit: %d", e) }
 func goVersionOK() bool {
 	const (
 		minGoVersionSemver = "v1.20.0"
-		suggestedGoVersion = "1.20.x"
+		suggestedGoVersion = "1.21"
 	)
 
 	// rxVersion looks for a version like "go1.2" or "go1.2.3"
@@ -306,7 +306,7 @@ func goVersionOK() bool {
 	if semver.Compare(builtVersionSemver, sharedCache.GoVersionSemver) < 0 {
 		fmt.Fprintf(os.Stderr, `
 garble was built with %q and is being used with %q; rebuild it with a command like:
-    garble install mvdan.cc/garble@latest
+    go install mvdan.cc/garble@latest
 `[1:], builtVersionFull, toolchainVersionFull)
 		return false
 	}
