@@ -266,8 +266,9 @@ type errJustExit int
 func (e errJustExit) Error() string { return fmt.Sprintf("exit: %d", e) }
 
 func goVersionOK() bool {
+	// TODO(mvdan): use go/version once we can require Go 1.22 or later: https://go.dev/issue/62039
 	const (
-		minGoVersionSemver = "v1.20.0"
+		minGoVersionSemver = "v1.21.0"
 		suggestedGoVersion = "1.21"
 	)
 
@@ -1329,7 +1330,7 @@ func (tf *transformer) processImportCfg(flags []string, requiredPkgs []string) (
 			// See exporttest/*.go in testdata/scripts/test.txt.
 			// For now, spot the pattern and avoid the unnecessary error;
 			// the dependency is unused, so the packagefile line is redundant.
-			// This still triggers as of go1.20.
+			// This still triggers as of go1.21.
 			if strings.HasSuffix(tf.curPkg.ImportPath, ".test]") && strings.HasPrefix(tf.curPkg.ImportPath, impPath) {
 				continue
 			}
@@ -1356,7 +1357,8 @@ type (
 	objectString = string // as per recordedObjectString
 
 	typeName struct {
-		PkgPath, Name string
+		PkgPath string // empty if builtin
+		Name    string
 	}
 )
 
@@ -1531,8 +1533,10 @@ func computePkgCache(fsCache *cache.Cache, lpkg *listedPackage, pkg *types.Packa
 			continue
 		}
 		aliasTypeName := typeName{
-			PkgPath: obj.Pkg().Path(),
-			Name:    obj.Name(),
+			Name: obj.Name(),
+		}
+		if pkg := obj.Pkg(); pkg != nil {
+			aliasTypeName.PkgPath = pkg.Path()
 		}
 		computed.EmbeddedAliasFields[vrStr] = aliasTypeName
 	}
@@ -1563,7 +1567,7 @@ func computePkgCache(fsCache *cache.Cache, lpkg *listedPackage, pkg *types.Packa
 // cmd/bundle will include a go:generate directive in its output by default.
 // Ours specifies a version and doesn't assume bundle is in $PATH, so drop it.
 
-//go:generate go run golang.org/x/tools/cmd/bundle@v0.5.0 -o cmdgo_quoted.go -prefix cmdgoQuoted cmd/internal/quoted
+//go:generate go run golang.org/x/tools/cmd/bundle -o cmdgo_quoted.go -prefix cmdgoQuoted cmd/internal/quoted
 //go:generate sed -i /go:generate/d cmdgo_quoted.go
 
 // computeLinkerVariableStrings iterates over the -ldflags arguments,
@@ -1663,6 +1667,7 @@ func typecheck(pkgPath string, files []*ast.File, origImporter importerWithMap) 
 		Selections: make(map[*ast.SelectorExpr]*types.Selection),
 		Instances:  make(map[*ast.Ident]types.Instance),
 	}
+	// TODO(mvdan): we should probably set types.Config.GoVersion from go.mod
 	origTypesConfig := types.Config{Importer: origImporter}
 	pkg, err := origTypesConfig.Check(pkgPath, fset, files, info)
 	if err != nil {
@@ -1892,19 +1897,21 @@ func (tf *transformer) transformGoFile(file *ast.File) *ast.File {
 			vrStr := recordedObjectString(vr)
 			aliasTypeName, ok := tf.curPkgCache.EmbeddedAliasFields[vrStr]
 			if ok {
-				pkg2 := tf.pkg
-				if path := aliasTypeName.PkgPath; pkg2.Path() != path {
+				aliasScope := tf.pkg.Scope()
+				if path := aliasTypeName.PkgPath; path == "" {
+					aliasScope = types.Universe
+				} else if path != tf.pkg.Path() {
 					// If the package is a dependency, import it.
 					// We can't grab the package via tf.pkg.Imports,
 					// because some of the packages under there are incomplete.
 					// ImportFrom will cache complete imports, anyway.
-					var err error
-					pkg2, err = tf.origImporter.ImportFrom(path, parentWorkDir, 0)
+					pkg2, err := tf.origImporter.ImportFrom(path, parentWorkDir, 0)
 					if err != nil {
 						panic(err)
 					}
+					aliasScope = pkg2.Scope()
 				}
-				tname, ok := pkg2.Scope().Lookup(aliasTypeName.Name).(*types.TypeName)
+				tname, ok := aliasScope.Lookup(aliasTypeName.Name).(*types.TypeName)
 				if !ok {
 					panic(fmt.Sprintf("EmbeddedAliasFields pointed %q to a missing type %q", vrStr, aliasTypeName))
 				}
@@ -1999,7 +2006,7 @@ func (tf *transformer) transformGoFile(file *ast.File) *ast.File {
 			if strct == nil {
 				panic("could not find struct for field " + name)
 			}
-			node.Name = hashWithStruct(strct, name)
+			node.Name = hashWithStruct(strct, obj)
 			if flagDebug { // TODO(mvdan): remove once https://go.dev/issue/53465 if fixed
 				log.Printf("%s %q hashed with struct fields to %q", debugName, name, node.Name)
 			}
@@ -2195,7 +2202,7 @@ func alterTrimpath(flags []string) []string {
 	return flagSetValue(flags, "-trimpath", sharedTempDir+"=>;"+trimpath)
 }
 
-// forwardBuildFlags is obtained from 'go help build' as of Go 1.20.
+// forwardBuildFlags is obtained from 'go help build' as of Go 1.21.
 var forwardBuildFlags = map[string]bool{
 	// These shouldn't be used in nested cmd/go calls.
 	"-a": false,
@@ -2235,7 +2242,7 @@ var forwardBuildFlags = map[string]bool{
 	"-workfile":      true,
 }
 
-// booleanFlags is obtained from 'go help build' and 'go help testflag' as of Go 1.20.
+// booleanFlags is obtained from 'go help build' and 'go help testflag' as of Go 1.21.
 var booleanFlags = map[string]bool{
 	// Shared build flags.
 	"-a":          true,
