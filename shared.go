@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"golang.org/x/mod/module"
-	"golang.org/x/mod/semver"
 )
 
 //go:generate ./scripts/gen-go-std-tables.sh
@@ -50,12 +49,12 @@ type sharedCacheType struct {
 
 	GOGARBLE string
 
-	// GoVersionSemver is a semver-compatible version of the Go toolchain
-	// currently being used, as reported by "go env GOVERSION".
+	// GoVersion is a version of the Go toolchain currently being used,
+	// as reported by "go env GOVERSION" and compatible with go/version.
 	// Note that the version of Go that built the garble binary might be newer.
 	// Also note that a devel version like "go1.22-231f290e51" is
-	// currently represented as "v1.22".
-	GoVersionSemver string
+	// currently represented as "go1.22", as the suffix is ignored by go/version.
+	GoVersion string
 
 	// Filled directly from "go env".
 	// Keep in sync with fetchGoEnv.
@@ -188,6 +187,7 @@ func (p *listedPackage) obfuscatedImportPath() string {
 	case "runtime", "reflect", "embed":
 		return p.ImportPath
 	}
+	// Intrinsics are matched by package import path as well.
 	if compilerIntrinsicsPkgs[p.ImportPath] {
 		return p.ImportPath
 	}
@@ -266,8 +266,6 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 				// Some packages in runtimeLinknamed need a build tag to be importable,
 				// like crypto/internal/boring/fipstls with boringcrypto,
 				// so any pkg.Error should be ignored when the build tag isn't set.
-			} else if pkg.ImportPath == "math/rand/v2" && semver.Compare(sharedCache.GoVersionSemver, "v1.22") < 0 {
-				// added in Go 1.22, so Go 1.21 runs into a "not found" error.
 			} else {
 				if pkgErrors.Len() > 0 {
 					pkgErrors.WriteString("\n")
@@ -387,7 +385,7 @@ func listPackage(from *listedPackage, path string) (*listedPackage, error) {
 				// We already have it; skip.
 			case sharedCache.GoEnv.GOOS != "js" && linknamed == "syscall/js":
 				// GOOS-specific package.
-			case sharedCache.GoEnv.GOOS != "darwin" && linknamed == "crypto/x509/internal/macos":
+			case sharedCache.GoEnv.GOOS != "darwin" && sharedCache.GoEnv.GOOS != "ios" && linknamed == "crypto/x509/internal/macos":
 				// GOOS-specific package.
 			default:
 				missing = append(missing, linknamed)

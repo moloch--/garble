@@ -29,7 +29,7 @@ binsubstr main$exe 'privateAdd'
 -- go.mod --
 module test/main
 
-go 1.21
+go 1.22
 -- main.go --
 package main
 
@@ -63,7 +63,7 @@ import (
 )
 
 /*
-#include "separate.h"
+#include "separate.h" // inline comment
 
 static int privateAdd(int a, int b) {
 	return a + b;
