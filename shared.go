@@ -183,8 +183,12 @@ func (p *listedPackage) obfuscatedImportPath() string {
 	//   * runtime: it is special in many ways
 	//   * reflect: its presence turns down dead code elimination
 	//   * embed: its presence enables using //go:embed
+	//   * others like syscall are allowed by import path to have more ABI tricks
+	//
+	// TODO: collect directly from cmd/internal/objabi/pkgspecial.go,
+	// in this particular case from allowAsmABIPkgs.
 	switch p.ImportPath {
-	case "runtime", "reflect", "embed":
+	case "runtime", "reflect", "embed", "syscall", "runtime/internal/startlinetest":
 		return p.ImportPath
 	}
 	// Intrinsics are matched by package import path as well.
@@ -375,7 +379,7 @@ func listPackage(from *listedPackage, path string) (*listedPackage, error) {
 			return pkg, nil
 		}
 		if listedRuntimeLinknamed {
-			panic(fmt.Sprintf("package %q still missing after go list call", path))
+			return nil, fmt.Errorf("package %q still missing after go list call", path)
 		}
 		startTime := time.Now()
 		missing := make([]string, 0, len(runtimeLinknamed))
@@ -393,11 +397,11 @@ func listPackage(from *listedPackage, path string) (*listedPackage, error) {
 		}
 		// We don't need any information about their dependencies, in this case.
 		if err := appendListedPackages(missing, false); err != nil {
-			panic(err) // should never happen
+			return nil, fmt.Errorf("failed to load missing runtime-linknamed packages: %v", err)
 		}
 		pkg, ok := sharedCache.ListedPackages[path]
 		if !ok {
-			panic(fmt.Sprintf("std listed another std package that we can't find: %s", path))
+			return nil, fmt.Errorf("std listed another std package that we can't find: %s", path)
 		}
 		listedRuntimeLinknamed = true
 		log.Printf("listed %d missing runtime-linknamed packages in %s", len(missing), debugSince(startTime))
