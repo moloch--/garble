@@ -7,6 +7,7 @@ import (
 	_ "embed"
 	"flag"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -85,13 +86,38 @@ func BenchmarkBuild(b *testing.B) {
 			"GARBLE_CACHE=" + garbleCache,
 			"GARBLE_WRITE_ALLOCS=true",
 		}
+		if prof := flag.Lookup("test.cpuprofile").Value.String(); prof != "" {
+			// Ensure the directory is empty and created, and pass it along, so that the garble
+			// sub-processes can also write CPU profiles.
+			// Collect and then merge the profiles as follows:
+			//
+			//    go test -run=- -vet=off -bench=. -benchtime=5x -cpuprofile=cpu.pprof
+			//    go tool pprof -proto cpu.pprof cpu.pprof-subproc/* >merged.pprof
+			dir, err := filepath.Abs(prof + "-subproc")
+			qt.Assert(b, qt.IsNil(err))
+			err = os.RemoveAll(dir)
+			qt.Assert(b, qt.IsNil(err))
+			err = os.MkdirAll(dir, 0o777)
+			qt.Assert(b, qt.IsNil(err))
+			env = append(env, "GARBLE_WRITE_CPUPROFILES="+dir)
+		}
+		if prof := flag.Lookup("test.memprofile").Value.String(); prof != "" {
+			// Same as before, but for allocation profiles.
+			dir, err := filepath.Abs(prof + "-subproc")
+			qt.Assert(b, qt.IsNil(err))
+			err = os.RemoveAll(dir)
+			qt.Assert(b, qt.IsNil(err))
+			err = os.MkdirAll(dir, 0o777)
+			qt.Assert(b, qt.IsNil(err))
+			env = append(env, "GARBLE_WRITE_MEMPROFILES="+dir)
+		}
 		args := []string{"build", "-v", "-o=" + outputBin, sourceDir}
 
 		for _, cached := range []bool{false, true} {
 			// The cached rebuild will reuse all dependencies,
 			// but rebuild the main package itself.
 			if cached {
-				writeSourceFile("rebuild.go", []byte(fmt.Sprintf("package main\nvar v%d int", i)))
+				writeSourceFile("rebuild.go", fmt.Appendf(nil, "package main\nvar v%d int", i))
 			}
 
 			cmd := exec.Command(os.Args[0], args...)
@@ -140,4 +166,64 @@ func BenchmarkBuild(b *testing.B) {
 		b.Fatal(err)
 	}
 	b.ReportMetric(float64(info.Size()), "bin-B")
+}
+
+func BenchmarkAbiOriginalNames(b *testing.B) {
+	// Benchmark two thousand obfuscated names in _originalNamePairs
+	// and a variety of input strings to reverse.
+	// As an example, the cmd/go binary ends up with about 2200 entries
+	// in _originalNamePairs as of November 2024, so it's a realistic figure.
+	// Structs with tens of fields are also relatively normal.
+	salt := []byte("some salt bytes")
+	for n := range 2000 {
+		name := fmt.Sprintf("name_%d", n)
+		garbled := hashWithCustomSalt(salt, name)
+		_originalNamePairs = append(_originalNamePairs, garbled, name)
+	}
+	_originalNamesInit()
+	// Pick twenty obfuscated names at random to use as inputs below.
+	// Use a deterministic random source so it's stable between benchmark runs.
+	rnd := rand.New(rand.NewPCG(1, 2))
+	var chosen []string
+	for i := 0; i < len(_originalNamePairs); i += 2 {
+		chosen = append(chosen, _originalNamePairs[i])
+	}
+	rnd.Shuffle(len(chosen), func(i, j int) {
+		chosen[i], chosen[j] = chosen[j], chosen[i]
+	})
+	chosen = chosen[:20]
+
+	inputs := []string{
+		// non-obfuscated names and types
+		"Error",
+		"int",
+		"*[]*interface {}",
+		"*map[uint64]bool",
+		// an obfuscated name
+		chosen[0],
+		// an obfuscated *pkg.Name
+		fmt.Sprintf("*%s.%s", chosen[1], chosen[2]),
+		// big struct with more than a dozen string field types
+		fmt.Sprintf("struct { %s string }", strings.Join(chosen[3:], " string ")),
+	}
+
+	var inputBytes int
+	for _, input := range inputs {
+		inputBytes += len(input)
+	}
+	b.SetBytes(int64(inputBytes))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	// We use a parallel benchmark because internal/abi's Name method
+	// is meant to be called by any goroutine at any time.
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			for _, input := range inputs {
+				_originalNames(input)
+			}
+		}
+	})
+	_originalNamePairs = []string{}
+	_originalNamesReplacer = nil
 }

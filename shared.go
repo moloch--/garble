@@ -14,13 +14,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"golang.org/x/mod/module"
 )
 
-//go:generate ./scripts/gen-go-std-tables.sh
+//go:generate go run scripts/gen_go_std_tables.go
 
 // sharedCacheType is shared as a read-only cache between the many garble toolexec
 // sub-processes.
@@ -29,7 +30,6 @@ import (
 // store it into a temporary file via gob encoding, and then reuse that file
 // in each of the garble toolexec sub-processes.
 type sharedCacheType struct {
-	ExecPath          string   // absolute path to the garble binary being used
 	ForwardBuildFlags []string // build flags fed to the original "garble ..." command
 
 	CacheDir string // absolute path to the GARBLE_CACHE directory being used
@@ -59,9 +59,9 @@ type sharedCacheType struct {
 	// Filled directly from "go env".
 	// Keep in sync with fetchGoEnv.
 	GoEnv struct {
-		GOOS string // i.e. the GOOS build target
+		GOOS   string // the GOOS build target
+		GOARCH string // the GOARCH build target
 
-		GOMOD     string
 		GOVERSION string
 		GOROOT    string
 	}
@@ -144,13 +144,11 @@ type listedPackage struct {
 	ForTest    string
 	Export     string
 	BuildID    string
-	Deps       []string
 	ImportMap  map[string]string
 	Standard   bool
 
 	Dir             string
 	CompiledGoFiles []string
-	IgnoredGoFiles  []string
 	Imports         []string
 
 	Error *packageError // to report package loading errors to the user
@@ -158,6 +156,11 @@ type listedPackage struct {
 	// The fields below are not part of 'go list', but are still reused
 	// between garble processes. Use "Garble" as a prefix to ensure no
 	// collisions with the JSON fields from 'go list'.
+
+	// allDeps is like the Deps field given by 'go list', but in the form of a map
+	// for the sake of fast lookups. It's also unnecessary to consume or store Deps
+	// as returned by 'go list', as it can be reconstructed from Imports.
+	allDeps map[string]struct{}
 
 	// GarbleActionID is a hash combining the Action ID from BuildID,
 	// with Garble's own inputs as per addGarbleToHash.
@@ -170,12 +173,67 @@ type listedPackage struct {
 	ToObfuscate bool `json:"-"`
 }
 
+func (p *listedPackage) hasDep(path string) bool {
+	if p.allDeps == nil {
+		p.allDeps = make(map[string]struct{}, len(p.Imports)*2)
+		p.addImportsFrom(p)
+	}
+	_, ok := p.allDeps[path]
+	return ok
+}
+
+func (p *listedPackage) addImportsFrom(from *listedPackage) {
+	for _, path := range from.Imports {
+		if path == "C" {
+			// `go list -json` shows "C" in Imports but not Deps.
+			// See https://go.dev/issue/60453.
+			continue
+		}
+		if path2 := from.ImportMap[path]; path2 != "" {
+			path = path2
+		}
+		if _, ok := p.allDeps[path]; ok {
+			continue // already added
+		}
+		p.allDeps[path] = struct{}{}
+		p.addImportsFrom(sharedCache.ListedPackages[path])
+	}
+}
+
 type packageError struct {
 	Pos string
 	Err string
 }
 
+// obfuscatedPackageName returns a package's obfuscated package name,
+// which may be unchanged in some cases where we cannot obfuscate it.
+// Note that package main is unchanged as it is treated in a special way by the toolchain.
+func (p *listedPackage) obfuscatedPackageName() string {
+	if p.Name == "main" || !p.ToObfuscate {
+		return p.Name
+	}
+	// The package name itself is obfuscated like any other name.
+	return hashWithPackage(p, p.Name)
+}
+
+// obfuscatedSourceDir returns an obfuscated directory name which can be used
+// to write obfuscated source files to. This directory name should be unique per package,
+// even when building many main packages at once, such as in `go test ./...`.
+func (p *listedPackage) obfuscatedSourceDir() string {
+	return hashWithPackage(p, p.ImportPath)
+}
+
+// obfuscatedImportPath returns a package's obfuscated import path,
+// which may be unchanged in some cases where we cannot obfuscate it.
+// Note that package main always has the unchanged import path "main" as part of a build,
+// but not if it's a main package as part of a test, which can be imported.
 func (p *listedPackage) obfuscatedImportPath() string {
+	if p.Name == "main" && p.ForTest == "" {
+		return "main"
+	}
+	if !p.ToObfuscate {
+		return p.ImportPath
+	}
 	// We can't obfuscate these standard library import paths,
 	// as the toolchain expects to recognize the packages by them:
 	//
@@ -191,10 +249,7 @@ func (p *listedPackage) obfuscatedImportPath() string {
 		return p.ImportPath
 	}
 	// Intrinsics are matched by package import path as well.
-	if compilerIntrinsicsPkgs[p.ImportPath] {
-		return p.ImportPath
-	}
-	if !p.ToObfuscate {
+	if _, ok := compilerIntrinsics[p.ImportPath]; ok {
 		return p.ImportPath
 	}
 	newPath := hashWithPackage(p, p.ImportPath)
@@ -231,7 +286,9 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 		// However, when loading standard library packages,
 		// using those flags would likely result in an error,
 		// as the standard library uses its own Go module and vendoring.
-		args = append(args, "-mod=", "-modfile=")
+		args = slices.DeleteFunc(args, func(arg string) bool {
+			return strings.HasPrefix(arg, "-mod=") || strings.HasPrefix(arg, "-modfile=")
+		})
 	}
 
 	args = append(args, packages...)
@@ -265,10 +322,13 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 		}
 
 		if perr := pkg.Error; perr != nil {
-			if pkg.Standard && len(pkg.CompiledGoFiles) == 0 && len(pkg.IgnoredGoFiles) > 0 {
+			if !mainBuild && strings.Contains(perr.Err, "build constraints exclude all Go files") {
 				// Some packages in runtimeLinknamed need a build tag to be importable,
 				// like crypto/internal/boring/fipstls with boringcrypto,
 				// so any pkg.Error should be ignored when the build tag isn't set.
+			} else if !mainBuild && strings.Contains(perr.Err, "is not in std") {
+				// When we support multiple Go versions at once, some packages may only
+				// exist in the newer version, so we fail to list them with the older.
 			} else {
 				if pkgErrors.Len() > 0 {
 					pkgErrors.WriteString("\n")
@@ -412,10 +472,8 @@ func listPackage(from *listedPackage, path string) (*listedPackage, error) {
 
 	// Packages outside std can list any package,
 	// as long as they depend on it directly or indirectly.
-	for _, dep := range from.Deps {
-		if dep == pkg.ImportPath {
-			return pkg, nil
-		}
+	if from.hasDep(pkg.ImportPath) {
+		return pkg, nil
 	}
 
 	// As a special case, any package can list runtime or its dependencies,
@@ -425,10 +483,8 @@ func listPackage(from *listedPackage, path string) (*listedPackage, error) {
 	if pkg.ImportPath == "runtime" {
 		return pkg, nil
 	}
-	for _, dep := range sharedCache.ListedPackages["runtime"].Deps {
-		if dep == pkg.ImportPath {
-			return pkg, nil
-		}
+	if sharedCache.ListedPackages["runtime"].hasDep(pkg.ImportPath) {
+		return pkg, nil
 	}
 
 	return nil, fmt.Errorf("list %s: %w", path, ErrNotDependency)

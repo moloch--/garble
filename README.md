@@ -2,7 +2,7 @@
 
 	go install mvdan.cc/garble@latest
 
-Obfuscate Go code by wrapping the Go toolchain. Requires Go 1.20 or later.
+Obfuscate Go code by wrapping the Go toolchain. Requires Go 1.23.5 or later.
 
 	garble build [build flags] [packages]
 
@@ -157,23 +157,7 @@ to document the current shortcomings of this tool.
   be required by interfaces. This area is a work in progress; see
   [#3](https://github.com/burrowers/garble/issues/3).
 
-* Garble automatically detects which Go types are used with reflection
-  to avoid obfuscating them, as that might break your program.
-  Note that Garble obfuscates [one package at a time](#speed),
-  so if your reflection code inspects a type from an imported package,
-  you may need to add a "hint" in the imported package to exclude obfuscating it:
-   ```go
-   type Message struct {
-       Command string
-       Args    string
-   }
-
-   // Never obfuscate the Message type.
-   var _ = reflect.TypeOf(Message{})
-   ```
-
 * Aside from `GOGARBLE` to select patterns of packages to obfuscate,
-  and the hint above with `reflect.TypeOf` to exclude obfuscating particular types,
   there is no supported way to exclude obfuscating a selection of files or packages.
   More often than not, a user would want to do this to work around a bug; please file the bug instead.
 
@@ -186,6 +170,10 @@ to document the current shortcomings of this tool.
 
 * Garble requires `git` to patch the linker. That can be avoided once go-gitdiff
   supports [non-strict patches](https://github.com/bluekeyes/go-gitdiff/issues/30).
+
+* APIs like [`runtime.GOROOT`](https://pkg.go.dev/runtime#GOROOT)
+  and [`runtime/debug.ReadBuildInfo`](https://pkg.go.dev/runtime/debug#ReadBuildInfo)
+  will not work in obfuscated binaries. This [can affect loading timezones](https://github.com/golang/go/issues/51473#issuecomment-2490564684), for example.
 
 ### Contributing
 

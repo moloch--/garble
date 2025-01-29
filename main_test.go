@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
+	"github.com/go-quicktest/qt"
 	"github.com/rogpeppe/go-internal/goproxytest"
 	"github.com/rogpeppe/go-internal/gotooltest"
 	"github.com/rogpeppe/go-internal/testscript"
@@ -41,11 +41,12 @@ func TestMain(m *testing.M) {
 		os.Setenv("GORACE", "atexit_sleep_ms=10")
 	}
 	if os.Getenv("RUN_GARBLE_MAIN") == "true" {
-		os.Exit(main1())
+		main()
+		return
 	}
-	os.Exit(testscript.RunMain(garbleMain{m}, map[string]func() int{
-		"garble": main1,
-	}))
+	testscript.Main(garbleMain{m}, map[string]func(){
+		"garble": main,
+	})
 }
 
 type garbleMain struct {
@@ -69,16 +70,12 @@ func TestScript(t *testing.T) {
 	t.Parallel()
 
 	execPath, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
+	qt.Assert(t, qt.IsNil(err))
 
 	tempCacheDir := t.TempDir()
 
 	hostCacheDir, err := os.UserCacheDir()
-	if err != nil {
-		t.Fatal(err)
-	}
+	qt.Assert(t, qt.IsNil(err))
 
 	p := testscript.Params{
 		Dir: filepath.Join("testdata", "script"),
@@ -426,9 +423,7 @@ func TestSplitFlagsFromArgs(t *testing.T) {
 			flags, args := splitFlagsFromArgs(test.args)
 			got := [2][]string{flags, args}
 
-			if diff := cmp.Diff(test.want, got); diff != "" {
-				t.Fatalf("splitFlagsFromArgs(%q) mismatch (-want +got):\n%s", test.args, diff)
-			}
+			qt.Assert(t, qt.DeepEquals(got, test.want))
 		})
 	}
 }
@@ -461,10 +456,7 @@ func TestFilterForwardBuildFlags(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			got, _ := filterForwardBuildFlags(test.flags)
-
-			if diff := cmp.Diff(test.want, got); diff != "" {
-				t.Fatalf("filterForwardBuildFlags(%q) mismatch (-want +got):\n%s", test.flags, diff)
-			}
+			qt.Assert(t, qt.DeepEquals(got, test.want))
 		})
 	}
 }
@@ -489,10 +481,7 @@ func TestFlagValue(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			got := flagValue(test.flags, test.flagName)
-			if got != test.want {
-				t.Fatalf("flagValue(%q, %q) got %q, want %q",
-					test.flags, test.flagName, got, test.want)
-			}
+			qt.Assert(t, qt.DeepEquals(got, test.want))
 		})
 	}
 }

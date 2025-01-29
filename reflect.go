@@ -1,17 +1,16 @@
 package main
 
 import (
-	"fmt"
 	"go/types"
-	"path/filepath"
+	"maps"
+	"slices"
 
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
 	"golang.org/x/tools/go/ssa"
 )
 
 type reflectInspector struct {
-	pkg *types.Package
+	lpkg *listedPackage
+	pkg  *types.Package
 
 	checkedAPIs map[string]bool
 
@@ -26,11 +25,11 @@ func (ri *reflectInspector) recordReflection(ssaPkg *ssa.Package) {
 		return
 	}
 
-	prevDone := len(ri.result.ReflectAPIs) + len(ri.result.ReflectObjects)
+	prevDone := len(ri.result.ReflectAPIs) + len(ri.result.ReflectObjectNames)
 
 	// find all unchecked APIs to add them to checkedAPIs after the pass
 	notCheckedAPIs := make(map[string]bool)
-	for _, knownAPI := range maps.Keys(ri.result.ReflectAPIs) {
+	for knownAPI := range maps.Keys(ri.result.ReflectAPIs) {
 		if !ri.checkedAPIs[knownAPI] {
 			notCheckedAPIs[knownAPI] = true
 		}
@@ -43,7 +42,7 @@ func (ri *reflectInspector) recordReflection(ssaPkg *ssa.Package) {
 	maps.Copy(ri.checkedAPIs, notCheckedAPIs)
 
 	// if a new reflectAPI is found we need to Re-evaluate all functions which might be using that API
-	newDone := len(ri.result.ReflectAPIs) + len(ri.result.ReflectObjects)
+	newDone := len(ri.result.ReflectAPIs) + len(ri.result.ReflectObjectNames)
 	if newDone > prevDone {
 		ri.recordReflection(ssaPkg) // TODO: avoid recursing
 	}
@@ -189,13 +188,13 @@ func (ri *reflectInspector) checkFunction(fun *ssa.Function) {
 			switch inst := inst.(type) {
 			case *ssa.Store:
 				obj := typeToObj(inst.Addr.Type())
-				if usedForReflect(ri.result, obj) {
+				if obj != nil && ri.usedForReflect(obj) {
 					ri.recordArgReflected(inst.Val, make(map[ssa.Value]bool))
 					ri.propagatedInstr[inst] = true
 				}
 			case *ssa.ChangeType:
 				obj := typeToObj(inst.X.Type())
-				if usedForReflect(ri.result, obj) {
+				if obj != nil && ri.usedForReflect(obj) {
 					ri.recursivelyRecordUsedForReflect(inst.Type())
 					ri.propagatedInstr[inst] = true
 				}
@@ -376,9 +375,7 @@ func relatedParam(val ssa.Value, visited map[ssa.Value]bool) *ssa.Parameter {
 		if param != nil {
 			return param
 		}
-
 	}
-
 	return nil
 }
 
@@ -395,10 +392,10 @@ func (ri *reflectInspector) recursivelyRecordUsedForReflect(t types.Type) {
 		if obj.Pkg() == nil || obj.Pkg() != ri.pkg {
 			return // not from the specified package
 		}
-		if usedForReflect(ri.result, obj) {
+		if ri.usedForReflect(obj) {
 			return // prevent endless recursion
 		}
-		ri.recordUsedForReflect(obj)
+		ri.recordUsedForReflect(obj, nil)
 
 		// Record the underlying type, too.
 		ri.recursivelyRecordUsedForReflect(t.Underlying())
@@ -415,7 +412,7 @@ func (ri *reflectInspector) recursivelyRecordUsedForReflect(t types.Type) {
 			}
 
 			// Record the field itself, too.
-			ri.recordUsedForReflect(field)
+			ri.recordUsedForReflect(field, t)
 
 			ri.recursivelyRecordUsedForReflect(field.Type())
 		}
@@ -426,66 +423,43 @@ func (ri *reflectInspector) recursivelyRecordUsedForReflect(t types.Type) {
 	}
 }
 
-// TODO: consider caching recordedObjectString via a map,
-// if that shows an improvement in our benchmark
-func recordedObjectString(obj types.Object) objectString {
-	if obj == nil {
-		return ""
-	}
+// obfuscatedObjectName returns the obfucated name of a types.Object,
+// parent is needed to correctly get the obfucated name of struct fields
+func (ri *reflectInspector) obfuscatedObjectName(obj types.Object, parent *types.Struct) string {
 	pkg := obj.Pkg()
 	if pkg == nil {
-		return ""
+		return "" // builtin types are never obfuscated
 	}
-	// Names which are not at the package level still need to avoid obfuscation in some cases:
-	//
-	// 1. Field names on global types, which can be reached via reflection.
-	// 2. Field names on anonymous types can also be reached via reflection.
-	// 3. Local named types can be embedded in a local struct, becoming a field name as well.
-	//
-	// For now, a hack: assume that packages don't declare the same field
-	// more than once in the same line. This works in practice, but one
-	// could craft Go code to break this assumption.
-	// Also note that the compiler's object files include filenames and line
-	// numbers, but not column numbers nor byte offsets.
-	if pkg.Scope() != obj.Parent() {
-		switch obj := obj.(type) {
-		case *types.Var: // struct fields; cases 1 and 2 above
-			if !obj.IsField() {
-				return "" // local variables don't need to be recorded
-			}
-		case *types.TypeName: // local named types; case 3 above
-		default:
-			return "" // other objects (labels, consts, etc) don't need to be recorded
-		}
-		pos := fset.Position(obj.Pos())
-		return fmt.Sprintf("%s.%s - %s:%d", pkg.Path(), obj.Name(),
-			filepath.Base(pos.Filename), pos.Line)
+
+	if v, ok := obj.(*types.Var); ok && parent != nil {
+		return hashWithStruct(parent, v)
 	}
-	// For top-level names, "pkgpath.Name" is unique.
-	return pkg.Path() + "." + obj.Name()
+
+	return hashWithPackage(ri.lpkg, obj.Name())
 }
 
 // recordUsedForReflect records the objects whose names we cannot obfuscate due to reflection.
 // We currently record named types and fields.
-func (ri *reflectInspector) recordUsedForReflect(obj types.Object) {
-	if obj.Pkg().Path() != ri.pkg.Path() {
+func (ri *reflectInspector) recordUsedForReflect(obj types.Object, parent *types.Struct) {
+	if obj.Pkg() != ri.pkg {
 		panic("called recordUsedForReflect with a foreign object")
 	}
-	objStr := recordedObjectString(obj)
-	if objStr == "" {
-		// If the object can't be described via a qualified string,
-		// do we need to record it at all?
+	obfName := ri.obfuscatedObjectName(obj, parent)
+	if obfName == "" {
 		return
 	}
-	ri.result.ReflectObjects[objStr] = struct{}{}
+	ri.result.ReflectObjectNames[obfName] = obj.Name()
 }
 
-func usedForReflect(cache pkgCache, obj types.Object) bool {
-	objStr := recordedObjectString(obj)
-	if objStr == "" {
+func (ri *reflectInspector) usedForReflect(obj types.Object) bool {
+	obfName := ri.obfuscatedObjectName(obj, nil)
+	if obfName == "" {
 		return false
 	}
-	_, ok := cache.ReflectObjects[objStr]
+	// TODO: Note that this does an object lookup by obfuscated name.
+	// We should probably use unique object identifiers or strings,
+	// such as go/types/objectpath.
+	_, ok := ri.result.ReflectObjectNames[obfName]
 	return ok
 }
 
