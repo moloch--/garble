@@ -1,0 +1,47 @@
+# We want the upgraded toolchain to match the garble binary
+# which we will exec below, as otherwise garble will complain.
+# Tell GOTOOLCHAIN to upgrade to the same version thanks to `go mod init`
+# setting up a `go` directive with its Go version.
+cd mod
+go mod init test
+cd ..
+go env GOVERSION
+setenvfile GOVERSION_UPGRADE stdout
+
+# To test that garble works with transparent upgrades via GOTOOLCHAIN,
+# use a relatively old version, but still new enough to support GOTOOLCHAIN.
+env GOVERSION_BASE=go1.23.0
+setup-go ${GOVERSION_BASE}
+
+# We want to use the real GOPROXY so that we can download the newer
+# toolchain, and we use the host's GOMODCACHE so we can reuse it.
+# Unset GONOSUMDB to get its default value, as TestScript's setup func
+# sets it to "*" to not use sum.golang.org with the testdata/mod modules.
+env GOPROXY=proxy.golang.org
+env GOMODCACHE=${HOST_GOMODCACHE}
+env GONOSUMDB=
+
+# Verify that we are using an older version of Go.
+exec go version
+stdout 'go version '${GOVERSION_BASE@R}
+
+# The builds inside the module use the upgraded toolchain.
+cd mod
+
+exec go run .
+stderr 'hello from '${GOVERSION_UPGRADE@R}
+
+# Note that garble hides runtime.Version by design, but we know that it requires
+# the Go toolchain version to match the exact same version that built garble,
+# and that version is most likely newer than GOVERSION_BASE.
+exec garble run .
+stderr 'hello from unknown'
+
+-- mod/main.go --
+package main
+
+import "runtime"
+
+func main() {
+	println("hello from", runtime.Version())
+}

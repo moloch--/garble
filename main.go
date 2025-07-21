@@ -42,7 +42,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/rogpeppe/go-internal/cache"
-	"golang.org/x/mod/module"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/ssa"
 	"mvdan.cc/garble/internal/ctrlflow"
@@ -291,8 +290,8 @@ func (e errJustExit) Error() string { return fmt.Sprintf("exit: %d", e) }
 
 func goVersionOK() bool {
 	const (
-		minGoVersion  = "go1.23.5" // the minimum Go version we support; could be a bugfix release if needed
-		unsupportedGo = "go1.24"   // the first major version we don't support
+		minGoVersion  = "go1.24" // the minimum Go version we support; could be a bugfix release if needed
+		unsupportedGo = "go1.25" // the first major version we don't support
 	)
 
 	// rxVersion looks for a version like "go1.2" or "go1.2.3" in `go env GOVERSION`.
@@ -369,38 +368,6 @@ func mainErr(args []string) error {
 		mod := &info.Main
 		if mod.Replace != nil {
 			mod = mod.Replace
-		}
-
-		// For the tests.
-		if v := os.Getenv("GARBLE_TEST_BUILDSETTINGS"); v != "" {
-			var extra []debug.BuildSetting
-			if err := json.Unmarshal([]byte(v), &extra); err != nil {
-				return err
-			}
-			info.Settings = append(info.Settings, extra...)
-		}
-
-		// Until https://github.com/golang/go/issues/50603 is implemented,
-		// manually construct something like a pseudo-version.
-		// TODO: remove when this code is dead, hopefully in Go 1.22.
-		if mod.Version == "(devel)" {
-			var vcsTime time.Time
-			var vcsRevision string
-			for _, setting := range info.Settings {
-				switch setting.Key {
-				case "vcs.time":
-					// If the format is invalid, we'll print a zero timestamp.
-					vcsTime, _ = time.Parse(time.RFC3339Nano, setting.Value)
-				case "vcs.revision":
-					vcsRevision = setting.Value
-					if len(vcsRevision) > 12 {
-						vcsRevision = vcsRevision[:12]
-					}
-				}
-			}
-			if vcsRevision != "" {
-				mod.Version = module.PseudoVersion("", "", vcsTime, vcsRevision)
-			}
 		}
 
 		fmt.Printf("%s %s\n\n", mod.Path, mod.Version)
@@ -602,16 +569,30 @@ This command wraps "go %s". Below is its help:
 	os.Setenv("GARBLE_SHARED", sharedTempDir)
 
 	if flagDebugDir != "" {
+		origDir := flagDebugDir
 		flagDebugDir, err = filepath.Abs(flagDebugDir)
 		if err != nil {
 			return nil, err
 		}
-
-		if err := os.RemoveAll(flagDebugDir); err != nil {
-			return nil, fmt.Errorf("could not empty debugdir: %v", err)
+		sentinel := filepath.Join(flagDebugDir, ".garble-debugdir")
+		if entries, err := os.ReadDir(flagDebugDir); errors.Is(err, fs.ErrNotExist) {
+		} else if err == nil && len(entries) == 0 {
+			// It's OK to delete an existing directory as long as it's empty.
+		} else if _, err := os.Lstat(sentinel); err == nil {
+			// It's OK to delete a non-empty directory which was created by an earlier
+			// invocation of `garble -debugdir`, which we know by leaving a sentinel file.
+			if err := os.RemoveAll(flagDebugDir); err != nil {
+				return nil, fmt.Errorf("could not empty debugdir: %v", err)
+			}
+		} else {
+			return nil, fmt.Errorf("debugdir %q has unknown contents; empty it first", origDir)
 		}
+
 		if err := os.MkdirAll(flagDebugDir, 0o755); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("could not create debugdir directory: %v", err)
+		}
+		if err := os.WriteFile(sentinel, nil, 0o666); err != nil {
+			return nil, fmt.Errorf("could not create debugdir sentinel: %v", err)
 		}
 	}
 
@@ -714,7 +695,7 @@ func (tf *transformer) transformAsm(args []string) ([]string, error) {
 
 			// Preprocessor lines to include another file.
 			// For example: #include "foo.h"
-			if quoted := strings.TrimPrefix(line, "#include"); quoted != line {
+			if quoted, ok := strings.CutPrefix(line, "#include"); ok {
 				quoted = strings.TrimSpace(quoted)
 				path, err := strconv.Unquote(quoted)
 				if err != nil { // note that strconv.Unquote errors do not include the input string
@@ -941,12 +922,14 @@ func parseFiles(lpkg *listedPackage, dir string, paths []string) (files []*ast.F
 
 		var src any
 
-		if lpkg.ImportPath == "internal/abi" && filepath.Base(path) == "type.go" {
+		base := filepath.Base(path)
+		if lpkg.ImportPath == "internal/abi" && base == "type.go" {
 			src, err = abiNamePatch(path)
 			if err != nil {
 				return nil, err
 			}
-		} else if mainPackage && reflectPatchFile == "" {
+		} else if mainPackage && reflectPatchFile == "" && !strings.HasPrefix(base, "_cgo_") {
+			// Note that we cannot add our code to e.g. _cgo_gotypes.go.
 			src, err = reflectMainPrePatch(path)
 			if err != nil {
 				return nil, err
@@ -960,11 +943,14 @@ func parseFiles(lpkg *listedPackage, dir string, paths []string) (files []*ast.F
 			return nil, err
 		}
 
-		if mainPackage && src != nil {
+		if mainPackage && src != "" {
 			astutil.AddNamedImport(fset, file, "_", "unsafe")
 		}
 
 		files = append(files, file)
+	}
+	if mainPackage && reflectPatchFile == "" {
+		return nil, fmt.Errorf("main packages must get reflect code patched in")
 	}
 	return files, nil
 }
@@ -1068,7 +1054,9 @@ func (tf *transformer) transformCompile(args []string) ([]string, error) {
 				updateEntryOffset(file, entryOffKey())
 			}
 		}
-		tf.transformDirectives(file.Comments)
+		if err := tf.transformDirectives(file.Comments); err != nil {
+			return nil, err
+		}
 		file = tf.transformGoFile(file)
 		file.Name.Name = tf.curPkg.obfuscatedPackageName()
 
@@ -1096,7 +1084,7 @@ func (tf *transformer) transformCompile(args []string) ([]string, error) {
 
 // transformDirectives rewrites //go:linkname toolchain directives in comments
 // to replace names with their obfuscated versions.
-func (tf *transformer) transformDirectives(comments []*ast.CommentGroup) {
+func (tf *transformer) transformDirectives(comments []*ast.CommentGroup) error {
 	for _, group := range comments {
 		for _, comment := range group.List {
 			if !strings.HasPrefix(comment.Text, "//go:linkname ") {
@@ -1118,6 +1106,17 @@ func (tf *transformer) transformDirectives(comments []*ast.CommentGroup) {
 			if len(fields) == 3 {
 				newName = fields[2]
 			}
+			switch newName {
+			case "runtime.lastmoduledatap", "runtime.moduledataverify1":
+				// Linknaming to the var and function above is used by github.com/bytedance/sonic/loader
+				// to inject functions into the runtime, but that breaks as garble patches
+				// the runtime to change the function header magic number.
+				//
+				// Given that Go is locking down access to runtime internals via go:linkname,
+				// and what sonic does was never supported and is a hack,
+				// refuse to build before the user sees confusing run-time panics.
+				return fmt.Errorf("garble does not support packages with a //go:linkname to %s", newName)
+			}
 
 			localName, newName = tf.transformLinkname(localName, newName)
 			fields[1] = localName
@@ -1131,6 +1130,7 @@ func (tf *transformer) transformDirectives(comments []*ast.CommentGroup) {
 			comment.Text = strings.Join(fields, " ")
 		}
 	}
+	return nil
 }
 
 func (tf *transformer) transformLinkname(localName, newName string) (string, string) {
@@ -1204,10 +1204,9 @@ func (tf *transformer) transformLinkname(localName, newName string) (string, str
 
 	var newForeignName string
 	if receiver, name, ok := strings.Cut(foreignName, "."); ok {
-		if strings.HasPrefix(receiver, "(*") {
+		if receiver, ok = strings.CutPrefix(receiver, "(*"); ok {
 			// pkg/path.(*Receiver).method
-			receiver = strings.TrimPrefix(receiver, "(*")
-			receiver = strings.TrimSuffix(receiver, ")")
+			receiver, _ = strings.CutSuffix(receiver, ")")
 			receiver = "(*" + hashWithPackage(lpkg, receiver) + ")"
 		} else {
 			// pkg/path.Receiver.method
@@ -1249,11 +1248,16 @@ func (tf *transformer) processImportCfg(flags []string, requiredPkgs []string) (
 	if requiredPkgs != nil {
 		newIndirectImports = make(map[string]bool)
 		for _, pkg := range requiredPkgs {
+			// unsafe is a special case, it's not a real dependency
+			if pkg == "unsafe" {
+				continue
+			}
+
 			newIndirectImports[pkg] = true
 		}
 	}
 
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -1351,7 +1355,7 @@ func (tf *transformer) processImportCfg(flags []string, requiredPkgs []string) (
 			// See exporttest/*.go in testdata/scripts/test.txt.
 			// For now, spot the pattern and avoid the unnecessary error;
 			// the dependency is unused, so the packagefile line is redundant.
-			// This still triggers as of go1.21.
+			// This still triggers as of go1.24.
 			if strings.HasSuffix(tf.curPkg.ImportPath, ".test]") && strings.HasPrefix(tf.curPkg.ImportPath, impPath) {
 				continue
 			}
@@ -1456,10 +1460,6 @@ func computePkgCache(fsCache *cache.Cache, lpkg *listedPackage, pkg *types.Packa
 	// Note that practically all errors from Cache.GetFile are a cache miss;
 	// for example, a file might exist but be empty if another process
 	// is filling the same cache entry concurrently.
-	//
-	// TODO: if A (curPkg) imports B and C, and B also imports C,
-	// then loading the gob files from both B and C is unnecessary;
-	// loading B's gob file would be enough. Is there an easy way to do that?
 	computed := pkgCache{
 		ReflectAPIs: map[funcFullName]map[int]bool{
 			"reflect.TypeOf":  {0: true},
@@ -1644,8 +1644,9 @@ func typecheck(pkgPath string, files []*ast.File, origImporter importerWithMap) 
 		Selections: make(map[*ast.SelectorExpr]*types.Selection),
 		Instances:  make(map[*ast.Ident]types.Instance),
 	}
-	// TODO(mvdan): we should probably set types.Config.GoVersion from go.mod
 	origTypesConfig := types.Config{
+		// Note that we don't set GoVersion here. Any Go language version checks
+		// are performed by the upfront `go list -json -compiled` call.
 		Importer: origImporter,
 		Sizes:    types.SizesFor("gc", sharedCache.GoEnv.GOARCH),
 	}
@@ -1731,6 +1732,8 @@ func recordType(used, origin types.Type, done map[*types.Named]bool, fieldToStru
 // Unsafe types: generic types and non-method interfaces.
 func isSafeForInstanceType(t types.Type) bool {
 	switch t := types.Unalias(t).(type) {
+	case *types.Basic:
+		return t.Kind() != types.Invalid
 	case *types.Named:
 		if t.TypeParams().Len() > 0 {
 			return false
@@ -1823,7 +1826,7 @@ func (tf *transformer) transformGoFile(file *ast.File) *ast.File {
 	// because obfuscated literals sometimes escape to heap,
 	// and that's not allowed in the runtime itself.
 	if flagLiterals && tf.curPkg.ToObfuscate {
-		file = literals.Obfuscate(tf.obfRand, file, tf.info, tf.linkerVariableStrings)
+		file = literals.Obfuscate(tf.obfRand, file, tf.info, tf.linkerVariableStrings, randomName)
 
 		// some imported constants might not be needed anymore, remove unnecessary imports
 		tf.useAllImports(file)
@@ -1966,7 +1969,7 @@ func (tf *transformer) transformGoFile(file *ast.File) *ast.File {
 				return true
 			}
 
-			sign := obj.Type().(*types.Signature)
+			sign := obj.Signature()
 			if sign.Recv() == nil {
 				debugName = "func"
 			} else {
@@ -2276,7 +2279,7 @@ func flagValue(flags []string, name string) string {
 // those whose values compose a list.
 func flagValueIter(flags []string, name string, fn func(string)) {
 	for i, arg := range flags {
-		if val := strings.TrimPrefix(arg, name+"="); val != arg {
+		if val, ok := strings.CutPrefix(arg, name+"="); ok {
 			// -name=value
 			fn(val)
 		}
@@ -2326,6 +2329,17 @@ To install Go, see: https://go.dev/doc/install
 	if err := json.Unmarshal(out, &sharedCache.GoEnv); err != nil {
 		return fmt.Errorf(`cannot unmarshal from "go env -json": %w`, err)
 	}
+
+	// Some Go version managers switch between Go versions via a GOROOT which symlinks
+	// to one of the available versions. Given that later we build a patched linker
+	// from GOROOT/src via `go build -overlay`, we need to resolve any symlinks.
+	// Note that this edge case has no tests as it's relatively rare.
+	sharedCache.GoEnv.GOROOT, err = filepath.EvalSymlinks(sharedCache.GoEnv.GOROOT)
+	if err != nil {
+		return err
+	}
+
+	sharedCache.GoCmd = filepath.Join(sharedCache.GoEnv.GOROOT, "bin", "go")
 	sharedCache.GOGARBLE = cmp.Or(os.Getenv("GOGARBLE"), "*") // we default to obfuscating everything
 	return nil
 }

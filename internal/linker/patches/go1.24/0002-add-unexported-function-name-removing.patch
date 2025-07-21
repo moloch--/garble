@@ -1,4 +1,4 @@
-From 05b8be787564fdcd9532e1aac5eca3ef41d4e0a1 Mon Sep 17 00:00:00 2001
+From 2a691e00bc659059133cd5604c7a099981cf684c Mon Sep 17 00:00:00 2001
 From: pagran <pagran@protonmail.com>
 Date: Mon, 9 Jan 2023 13:30:36 +0100
 Subject: [PATCH 2/3] add unexported function name removing
@@ -8,7 +8,7 @@ Subject: [PATCH 2/3] add unexported function name removing
  1 file changed, 42 insertions(+), 1 deletion(-)
 
 diff --git a/cmd/link/internal/ld/pcln.go b/cmd/link/internal/ld/pcln.go
-index c09ae07e33..056a1d3a72 100644
+index 7bae9f18c5..b497573b15 100644
 --- a/cmd/link/internal/ld/pcln.go
 +++ b/cmd/link/internal/ld/pcln.go
 @@ -8,6 +8,10 @@ import (
@@ -81,5 +81,5 @@ index c09ae07e33..056a1d3a72 100644
  
  	state.funcnametab = state.addGeneratedSym(ctxt, "runtime.funcnametab", size, writeFuncNameTab)
 -- 
-2.46.0
+2.48.1
 

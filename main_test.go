@@ -83,7 +83,15 @@ func TestScript(t *testing.T) {
 			// Use testdata/mod as our module proxy.
 			env.Setenv("GOPROXY", proxyURL)
 
-			// We use our own proxy, so avoid sum.golang.org.
+			// gotoolchain.txtar is one test which wants to reuse GOMODCACHE.
+			out, err := exec.Command("go", "env", "GOMODCACHE").Output()
+			if err != nil {
+				return err
+			}
+			env.Setenv("HOST_GOMODCACHE", strings.TrimSpace(string(out)))
+
+			// We use our own GOPROXY above, so avoid using sum.golang.org,
+			// as we would fail to update any go.sum file in the testscripts.
 			env.Setenv("GONOSUMDB", "*")
 
 			// "go build" starts many short-lived Go processes,
@@ -117,7 +125,7 @@ func TestScript(t *testing.T) {
 		Condition: func(cond string) (bool, error) {
 			switch cond {
 			case "cgo":
-				out, err := exec.Command("go", "env", "CGO_ENABLED").CombinedOutput()
+				out, err := exec.Command("go", "env", "CGO_ENABLED").Output()
 				if err != nil {
 					return false, err
 				}
@@ -138,6 +146,7 @@ func TestScript(t *testing.T) {
 			"generate-literals": generateLiterals,
 			"setenvfile":        setenvfile,
 			"grepfiles":         grepfiles,
+			"setup-go":          setupGo,
 		},
 		UpdateScripts:       *update,
 		RequireExplicitExec: true,
@@ -381,6 +390,25 @@ func grepfiles(ts *testscript.TestScript, neg bool, args []string) {
 	if !neg && !anyFound {
 		ts.Fatalf("no matches for %q", pattern)
 	}
+}
+
+func setupGo(ts *testscript.TestScript, neg bool, args []string) {
+	if neg || len(args) != 1 {
+		ts.Fatalf("usage: setup-go version")
+	}
+	// Download the version of Go specified as an argument, cache it in GOMODCACHE,
+	// and get its GOROOT directory inside the cache so we can use it.
+	cmd := exec.Command("go", "env", "GOROOT")
+	cmd.Env = append(cmd.Environ(), "GOTOOLCHAIN="+args[0])
+	out, err := cmd.Output()
+	ts.Check(err)
+
+	goroot := strings.TrimSpace(string(out))
+
+	ts.Setenv("PATH", filepath.Join(goroot, "bin")+string(os.PathListSeparator)+ts.Getenv("PATH"))
+	// Remove GOROOT from the environment, as it is unnecessary and gets in the way
+	// when we want to test GOTOOLCHAIN upgrades, which will need different GOROOTs.
+	ts.Setenv("GOROOT", "")
 }
 
 func TestSplitFlagsFromArgs(t *testing.T) {
