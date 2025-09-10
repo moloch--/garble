@@ -152,7 +152,8 @@ type listedPackage struct {
 	Standard   bool
 
 	Dir             string
-	CompiledGoFiles []string
+	CompiledGoFiles []string // all .go files to build
+	SFiles          []string // all .s (asm) files to build
 	Imports         []string
 
 	Error *packageError // to report package loading errors to the user
@@ -245,11 +246,16 @@ func (p *listedPackage) obfuscatedImportPath() string {
 	//   * reflect: its presence turns down dead code elimination
 	//   * embed: its presence enables using //go:embed
 	//   * others like syscall are allowed by import path to have more ABI tricks
-	//
-	// TODO: collect directly from cmd/internal/objabi/pkgspecial.go,
-	// in this particular case from allowAsmABIPkgs.
 	switch p.ImportPath {
-	case "runtime", "reflect", "embed", "syscall", "runtime/internal/startlinetest":
+	case "runtime", "reflect", "embed",
+		// TODO: collect directly from cmd/internal/objabi/pkgspecial.go,
+		// in this particular case from allowAsmABIPkgs.
+		"syscall",
+		"internal/bytealg",
+		"internal/chacha8rand",
+		"internal/runtime/syscall/linux",
+		"internal/runtime/syscall/windows",
+		"internal/runtime/startlinetest":
 		return p.ImportPath
 	}
 	// Intrinsics are matched by package import path as well.
@@ -278,7 +284,7 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 		// When loading the top-level packages we are building,
 		// we want to transitively load all their dependencies as well.
 		// That is not the case when loading standard library packages,
-		// as runtimeLinknamed already contains transitive dependencies.
+		// as runtimeAndLinknamed already contains transitive dependencies.
 		args = append(args, "-deps")
 	}
 	args = append(args, garbleBuildFlags...)
@@ -327,7 +333,7 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 
 		if perr := pkg.Error; perr != nil {
 			if !mainBuild && strings.Contains(perr.Err, "build constraints exclude all Go files") {
-				// Some packages in runtimeLinknamed need a build tag to be importable,
+				// Some packages in runtimeAndLinknamed need a build tag to be importable,
 				// like crypto/internal/boring/fipstls with boringcrypto,
 				// so any pkg.Error should be ignored when the build tag isn't set.
 			} else if !mainBuild && strings.Contains(perr.Err, "is not in std") {
@@ -408,7 +414,7 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 	return nil
 }
 
-var listedRuntimeLinknamed = false
+var listedRuntimeAndLinknamed = false
 
 var ErrNotFound = errors.New("not found")
 
@@ -433,20 +439,20 @@ func listPackage(from *listedPackage, path string) (*listedPackage, error) {
 	// This is due to how runtime linkname-implements std packages,
 	// such as sync/atomic or reflect, without importing them in any way.
 	// A few other cases don't involve runtime, like time/tzdata linknaming to time,
-	// but luckily those few cases are covered by runtimeLinknamed as well.
+	// but luckily those few cases are covered by runtimeAndLinknamed as well.
 	//
-	// If ListedPackages lacks such a package we fill it via runtimeLinknamed.
-	// TODO: can we instead add runtimeLinknamed to the top-level "go list" args?
+	// If ListedPackages lacks such a package we fill it via runtimeAndLinknamed.
+	// TODO: can we instead add runtimeAndLinknamed to the top-level "go list" args?
 	if from.Standard {
 		if ok {
 			return pkg, nil
 		}
-		if listedRuntimeLinknamed {
+		if listedRuntimeAndLinknamed {
 			return nil, fmt.Errorf("package %q still missing after go list call", path)
 		}
 		startTime := time.Now()
-		missing := make([]string, 0, len(runtimeLinknamed))
-		for _, linknamed := range runtimeLinknamed {
+		missing := make([]string, 0, len(runtimeAndLinknamed))
+		for _, linknamed := range runtimeAndLinknamed {
 			switch {
 			case sharedCache.ListedPackages[linknamed] != nil:
 				// We already have it; skip.
@@ -466,7 +472,7 @@ func listPackage(from *listedPackage, path string) (*listedPackage, error) {
 		if !ok {
 			return nil, fmt.Errorf("std listed another std package that we can't find: %s", path)
 		}
-		listedRuntimeLinknamed = true
+		listedRuntimeAndLinknamed = true
 		log.Printf("listed %d missing runtime-linknamed packages in %s", len(missing), debugSince(startTime))
 		return pkg, nil
 	}
