@@ -36,10 +36,10 @@ jobs:
         run: GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -o ./bin/garble_windows-arm64.exe .
 
       - name: Darwin (amd64)
-        run: GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -o ./bin/garble_macos-amd64 .
+        run: GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -o ./bin/garble_darwin-amd64 .
 
       - name: Darwin (arm64)
-        run: GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o ./bin/garble_macos-arm64 .
+        run: GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o ./bin/garble_darwin-arm64 .
 
       - name: "Publish Release"
         uses: "bishopfox/action-gh-release@v1"
