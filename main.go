@@ -539,40 +539,39 @@ func goVersionOK() bool {
 		unsupportedGo = "go1.26"   // the first major version we don't support
 	)
 
-	// rxVersion looks for a version like "go1.2" or "go1.2.3" in `go env GOVERSION`.
-	rxVersion := regexp.MustCompile(`go\d+\.\d+(?:\.\d+)?`)
-
-	toolchainVersionFull := sharedCache.GoEnv.GOVERSION
-	sharedCache.GoVersion = rxVersion.FindString(toolchainVersionFull)
-	if sharedCache.GoVersion == "" {
+	toolchainVersion := sharedCache.GoEnv.GOVERSION
+	if toolchainVersion == "" {
 		// Go 1.15.x and older did not have GOVERSION yet; they are too old anyway.
 		fmt.Fprintf(os.Stderr, "Go version is too old; please upgrade to %s or newer\n", minGoVersion)
 		return false
 	}
 
-	if version.Compare(sharedCache.GoVersion, minGoVersion) < 0 {
-		fmt.Fprintf(os.Stderr, "Go version %q is too old; please upgrade to %s or newer\n", toolchainVersionFull, minGoVersion)
+	if !version.IsValid(toolchainVersion) {
+		fmt.Fprintf(os.Stderr, "Go version %q appears to be invalid or too old; use %s or newer\n", toolchainVersion, minGoVersion)
 		return false
 	}
-	if version.Compare(sharedCache.GoVersion, unsupportedGo) >= 0 {
-		fmt.Fprintf(os.Stderr, "Go version %q is too new; Go linker patches aren't available for %s or later yet\n", toolchainVersionFull, unsupportedGo)
+	if version.Compare(toolchainVersion, minGoVersion) < 0 {
+		fmt.Fprintf(os.Stderr, "Go version %q is too old; please upgrade to %s or newer\n", toolchainVersion, minGoVersion)
+		return false
+	}
+	if version.Compare(toolchainVersion, unsupportedGo) >= 0 {
+		fmt.Fprintf(os.Stderr, "Go version %q is too new; Go linker patches aren't available for %s or later yet\n", toolchainVersion, unsupportedGo)
 		return false
 	}
 
 	// Ensure that the version of Go that built the garble binary is equal or
 	// newer than cache.GoVersionSemver.
-	builtVersionFull := cmp.Or(os.Getenv("GARBLE_TEST_GOVERSION"), runtime.Version())
-	builtVersion := rxVersion.FindString(builtVersionFull)
-	if builtVersion == "" {
+	builtVersion := cmp.Or(os.Getenv("GARBLE_TEST_GOVERSION"), runtime.Version())
+	if !version.IsValid(builtVersion) {
 		// If garble built itself, we don't know what Go version was used.
 		// Fall back to not performing the check against the toolchain version.
 		return true
 	}
-	if version.Compare(builtVersion, sharedCache.GoVersion) < 0 {
+	if version.Compare(builtVersion, toolchainVersion) < 0 {
 		fmt.Fprintf(os.Stderr, `
 garble was built with %q and can't be used with the newer %q; rebuild it with a command like:
     go install mvdan.cc/garble@latest
-`[1:], builtVersionFull, toolchainVersionFull)
+`[1:], builtVersion, toolchainVersion)
 		return false
 	}
 
@@ -732,6 +731,9 @@ To install Go, see: https://go.dev/doc/install
 	if err := json.Unmarshal(out, &sharedCache.GoEnv); err != nil {
 		return fmt.Errorf(`cannot unmarshal from "go env -json": %w`, err)
 	}
+	// TODO: remove once https://github.com/golang/go/issues/75953 is fixed,
+	// such that `go env GOVERSION` can always be parsed by go/version.
+	sharedCache.GoEnv.GOVERSION, _, _ = strings.Cut(sharedCache.GoEnv.GOVERSION, " ")
 
 	// Some Go version managers switch between Go versions via a GOROOT which symlinks
 	// to one of the available versions. Given that later we build a patched linker
