@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"fmt"
 	"go/types"
+	"log"
 	"maps"
 	"os"
 	"slices"
@@ -167,7 +168,7 @@ func (ri *reflectInspector) ignoreReflectedTypes(ssaPkg *ssa.Package) {
 	}
 }
 
-// Exported methods with unnamed structs as paramters may be "used" in interface declarations
+// Exported methods with unnamed structs as parameters may be "used" in interface declarations
 // elsewhere, these interfaces will break if any method uses reflection on the same parameter.
 //
 // Therefore never obfuscate unnamed structs which are used as a method parameter
@@ -211,8 +212,9 @@ func (ri *reflectInspector) checkMethodSignature(reflectParams map[int]bool, sig
 // Checks the signature of an interface method for potential reflection use.
 func (ri *reflectInspector) checkInterfaceMethod(m *types.Func) {
 	reflectParams := make(map[int]bool)
+	methodName, _ := stripTypeArgs(m.FullName())
 
-	maps.Copy(reflectParams, ri.result.ReflectAPIs[m.FullName()])
+	maps.Copy(reflectParams, ri.result.ReflectAPIs[methodName])
 
 	sig := m.Signature()
 	if m.Exported() {
@@ -220,7 +222,7 @@ func (ri *reflectInspector) checkInterfaceMethod(m *types.Func) {
 	}
 
 	if len(reflectParams) > 0 {
-		ri.result.ReflectAPIs[m.FullName()] = reflectParams
+		ri.result.ReflectAPIs[methodName] = reflectParams
 
 		/* fmt.Printf("curPkgCache.ReflectAPIs: %v\n", curPkgCache.ReflectAPIs) */
 	}
@@ -233,11 +235,16 @@ func (ri *reflectInspector) checkFunction(fun *ssa.Function) {
 	// 	fun.WriteTo(os.Stdout)
 	// }
 
-	f, _ := fun.Object().(*types.Func)
+	f, _ := ssaFuncOrigin(fun).Object().(*types.Func)
+	var funcName string
+	genericFunc := false
+	if f != nil {
+		funcName, genericFunc = stripTypeArgs(f.FullName())
+	}
 
 	reflectParams := make(map[int]bool)
-	if f != nil {
-		maps.Copy(reflectParams, ri.result.ReflectAPIs[f.FullName()])
+	if funcName != "" {
+		maps.Copy(reflectParams, ri.result.ReflectAPIs[funcName])
 
 		if f.Exported() {
 			ri.checkMethodSignature(reflectParams, fun.Signature)
@@ -268,9 +275,22 @@ func (ri *reflectInspector) checkFunction(fun *ssa.Function) {
 					ri.propagatedInstr[inst] = true
 				}
 			case *ssa.Call:
-				callName := inst.Call.Value.String()
-				if m := inst.Call.Method; m != nil {
+				callName := ""
+				if callee := inst.Call.StaticCallee(); callee != nil {
+					if obj, ok := ssaFuncOrigin(callee).Object().(*types.Func); ok && obj != nil {
+						callName = obj.FullName()
+					}
+				}
+				if callName == "" && inst.Call.Method != nil {
 					callName = inst.Call.Method.FullName()
+				}
+				if callName == "" {
+					callName = inst.Call.Value.String()
+				}
+				rawCallName := callName
+				callName, genericCall := stripTypeArgs(callName)
+				if flagDebug && genericCall {
+					log.Printf("reflect: normalized call %q to %q", rawCallName, callName)
 				}
 
 				if ri.checkedAPIs[callName] {
@@ -283,12 +303,26 @@ func (ri *reflectInspector) checkFunction(fun *ssa.Function) {
 				// record each call argument passed to a function parameter which is used in reflection
 				knownParams := ri.result.ReflectAPIs[callName]
 				for knownParam := range knownParams {
-					if len(inst.Call.Args) <= knownParam {
+					sig := inst.Call.Signature()
+					if sig == nil {
+						continue
+					}
+					// SSA call arguments can include synthetic leading values
+					// before the declared parameters. Use the signature to find
+					// where the real parameters start.
+					//
+					// Example for method M(x):
+					//   - direct call `t.M(x)` often has Call.Args = [t, x]
+					//   - bound call  `f := t.M; f(x)` has Call.Args = [x]
+					// In both cases Params().Len() == 1, so firstParamArg is
+					// len(Args)-1, and parameter x resolves correctly.
+					firstParamArg := len(inst.Call.Args) - sig.Params().Len()
+					argPos := firstParamArg + knownParam
+					if argPos < 0 || argPos >= len(inst.Call.Args) {
 						continue
 					}
 
-					arg := inst.Call.Args[knownParam]
-
+					arg := inst.Call.Args[argPos]
 					/* fmt.Printf("flagging arg: %v\n", arg) */
 
 					reflectedParam := ri.recordArgReflected(arg, make(map[ssa.Value]bool))
@@ -297,6 +331,13 @@ func (ri *reflectInspector) checkFunction(fun *ssa.Function) {
 					}
 
 					pos := slices.Index(fun.Params, reflectedParam)
+					if genericFunc {
+						// Generic functions may include synthetic parameters.
+						extra := len(fun.Params) - fun.Signature.Params().Len()
+						if extra > 0 {
+							pos -= extra
+						}
+					}
 					if pos < 0 {
 						continue
 					}
@@ -304,13 +345,27 @@ func (ri *reflectInspector) checkFunction(fun *ssa.Function) {
 					/* fmt.Printf("recorded param: %v func: %v\n", pos, fun) */
 
 					reflectParams[pos] = true
+					if fun.Signature.Recv() != nil && pos > 0 {
+						// Methods may be called with or without the receiver in
+						// Call.Args depending on SSA form. Record both indexes.
+						reflectParams[pos-1] = true
+					}
+					if flagDebug {
+						log.Printf("reflect: %s marks param %d reflected via %s argument %T", fun, pos, callName, arg)
+					}
 				}
 			}
 		}
 	}
 
 	if len(reflectParams) > 0 {
-		ri.result.ReflectAPIs[f.FullName()] = reflectParams
+		if funcName == "" {
+			return
+		}
+		ri.result.ReflectAPIs[funcName] = reflectParams
+		if flagDebug {
+			log.Printf("reflect: function %s has reflected params %v", funcName, reflectParams)
+		}
 
 		/* fmt.Printf("curPkgCache.ReflectAPIs: %v\n", curPkgCache.ReflectAPIs) */
 	}
@@ -318,7 +373,7 @@ func (ri *reflectInspector) checkFunction(fun *ssa.Function) {
 
 // recordArgReflected finds the type(s) of a function argument, which is being used in reflection
 // and excludes these types from obfuscation
-// It also checks if this argument has any relation to a function paramter and returns it if found.
+// It also checks if this argument has any relation to a function parameter and returns it if found.
 func (ri *reflectInspector) recordArgReflected(val ssa.Value, visited map[ssa.Value]bool) *ssa.Parameter {
 	// make sure we visit every val only once, otherwise there will be infinite recursion
 	if visited[val] {
@@ -368,6 +423,7 @@ func (ri *reflectInspector) recordArgReflected(val ssa.Value, visited map[ssa.Va
 
 	case *ssa.ChangeType:
 		ri.recursivelyRecordUsedForReflect(val.X.Type())
+		return ri.recordArgReflected(val.X, visited)
 	case *ssa.MakeSlice, *ssa.MakeMap, *ssa.MakeChan, *ssa.Const:
 		ri.recursivelyRecordUsedForReflect(val.Type())
 	case *ssa.Global:
@@ -387,8 +443,8 @@ func (ri *reflectInspector) recordArgReflected(val ssa.Value, visited map[ssa.Va
 	return nil
 }
 
-// relatedParam checks if a route to a function paramter can be constructed
-// from a ssa.Value, and returns the paramter if it found one.
+// relatedParam checks if a route to a function parameter can be constructed
+// from a ssa.Value, and returns the parameter if it found one.
 func relatedParam(val ssa.Value, visited map[ssa.Value]bool) *ssa.Parameter {
 	// every val should only be visited once to prevent infinite recursion
 	if visited[val] {
@@ -401,7 +457,7 @@ func relatedParam(val ssa.Value, visited map[ssa.Value]bool) *ssa.Parameter {
 
 	switch x := val.(type) {
 	case *ssa.Parameter:
-		// a paramter has been found
+		// a parameter has been found
 		return x
 	case *ssa.UnOp:
 		if param := relatedParam(x.X, visited); param != nil {
@@ -492,8 +548,8 @@ func (ri *reflectInspector) recursivelyRecordUsedForReflect(t types.Type) {
 	}
 }
 
-// obfuscatedObjectName returns the obfucated name of a types.Object,
-// parent is needed to correctly get the obfucated name of struct fields
+// obfuscatedObjectName returns the obfuscated name of a types.Object,
+// parent is needed to correctly get the obfuscated name of struct fields
 func (ri *reflectInspector) obfuscatedObjectName(obj types.Object, parent *types.Struct) string {
 	pkg := obj.Pkg()
 	if pkg == nil {
@@ -518,6 +574,9 @@ func (ri *reflectInspector) recordUsedForReflect(obj types.Object, parent *types
 		return
 	}
 	ri.result.ReflectObjectNames[obfName] = obj.Name()
+	if flagDebug {
+		log.Printf("reflect: preserving object %s as %q -> %q", obj, obfName, obj.Name())
+	}
 }
 
 func (ri *reflectInspector) usedForReflect(obj types.Object) bool {
@@ -546,4 +605,41 @@ func typeToObj(typ types.Type) types.Object {
 		return typeToObj(t.Elem())
 	}
 	return nil
+}
+
+// stripTypeArgs removes generic type arguments from instantiated names like:
+// "main.F[main.T]" -> "main.F"
+// "(*pkg.Type[go.shape.int]).Method" -> "(*pkg.Type).Method"
+// The second return value indicates whether any type arguments were stripped.
+func stripTypeArgs(name string) (string, bool) {
+	if !strings.Contains(name, "[") {
+		return name, false
+	}
+	var b strings.Builder
+	b.Grow(len(name))
+	depth := 0
+	for _, r := range name {
+		switch r {
+		case '[':
+			depth++
+		case ']':
+			if depth > 0 {
+				depth--
+				continue
+			}
+			b.WriteRune(r)
+		default:
+			if depth == 0 {
+				b.WriteRune(r)
+			}
+		}
+	}
+	return b.String(), true
+}
+
+func ssaFuncOrigin(fn *ssa.Function) *ssa.Function {
+	if orig := fn.Origin(); orig != nil {
+		return orig
+	}
+	return fn
 }

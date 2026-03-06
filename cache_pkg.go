@@ -20,8 +20,8 @@ import (
 )
 
 type (
-	funcFullName = string // as per go/types.Func.FullName
-	objectString = string // as per recordedObjectString
+	funcFullName = string // the result of [types.Func.FullName] plus [stripTypeArgs]
+	objectString = string // the result of [reflectInspector.obfuscatedObjectName]
 )
 
 // pkgCache contains information about a package that will be stored in fsCache.
@@ -179,8 +179,9 @@ func computePkgCache(fsCache *cache.Cache, lpkg *listedPackage, pkg *types.Packa
 					return err
 				}
 				defer f.Close()
+				// The gob decoder
 				if err := gob.NewDecoder(f).Decode(&computed); err != nil {
-					return fmt.Errorf("gob decode: %w", err)
+					return err
 				}
 				return nil
 			}
