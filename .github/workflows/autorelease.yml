@@ -6,6 +6,9 @@ on:
       - "v*.*.*"
     branches: master
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Release Build
@@ -15,7 +18,7 @@ jobs:
       - name: Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25.8"
+          go-version: "1.26.2"
 
       - name: Check out code into the Go module directory
         uses: actions/checkout@v3
@@ -42,7 +45,11 @@ jobs:
         run: GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o ./bin/garble_darwin-arm64 .
 
       - name: "Publish Release"
-        uses: "bishopfox/action-gh-release@v1"
-        with:
-          files: |
-            ./bin/*
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" ./bin/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "" \
+            --verify-tag
