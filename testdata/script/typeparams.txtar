@@ -7,6 +7,8 @@ go 1.23
 -- garble_main.go --
 package main
 
+import "test/main/lib"
+
 func main() {
 	GenericFunc[int, int](1, 2)
 	var _ GenericVector[int]
@@ -21,6 +23,10 @@ func main() {
 	ga.list = nil
 	var gan genericAliasNamed
 	gan.list = nil
+
+	e := lib.Entry[string, int]{Key: "foo", Data: 123}
+	r := lib.Load[string, int](e)
+	_ = r.Data
 }
 
 func GenericFunc[GenericParamA, B any](x GenericParamA, y B) {}
@@ -97,3 +103,18 @@ func byKeys[T any](m map[string]T) []struct {
 }
 
 var _ = byKeys(map[string]int{"one": 1})
+-- lib/lib.go --
+package lib
+
+type Result[Data any] struct {
+	Data Data
+}
+
+type Entry[Key ~string, Data any] struct {
+	Key  Key
+	Data Data
+}
+
+func Load[Key ~string, Data any](e Entry[Key, Data]) Result[Data] {
+	return Result[Data]{Data: e.Data}
+}

@@ -1,5 +1,14 @@
 # Changelog
 
+## [v0.16.0] - 2026-04-12
+
+This release adds support for Go 1.26 and drops support for Go 1.25.
+
+A number of fixes are also included:
+* Fix a number of bugs relating to obfuscating generic struct types
+* Fix a bug where using `-tiny` would cause GODEBUG knobs to be ignored
+* Improve the reflect detection to support `gin` templates
+
 ## [v0.15.0] - 2025-08-31
 
 This release adds support for Go 1.25 and drops support for Go 1.23
@@ -354,6 +363,8 @@ Known bugs:
 * obfuscating the standard library with `GOPRIVATE=*` is not well supported yet
 * `garble test` is temporarily disabled, as it is currently broken
 
+[v0.16.0]: https://github.com/burrowers/garble/releases/tag/v0.16.0
+[v0.15.0]: https://github.com/burrowers/garble/releases/tag/v0.15.0
 [v0.14.2]: https://github.com/burrowers/garble/releases/tag/v0.14.2
 [v0.14.1]: https://github.com/burrowers/garble/releases/tag/v0.14.1
 [v0.14.0]: https://github.com/burrowers/garble/releases/tag/v0.14.0

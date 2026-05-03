@@ -3,7 +3,10 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmp"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +15,7 @@ import (
 	"go/types"
 	"io/fs"
 	"log"
+	"maps"
 	mathrand "math/rand"
 	"os"
 	"path/filepath"
@@ -56,11 +60,11 @@ func computeLinkerVariableStrings(pkg *types.Package) (map[*types.Var]string, er
 	if err != nil {
 		return nil, err
 	}
-	flagValueIter(ldflags, "-X", func(val string) {
+	for val := range flagValues(ldflags, "-X") {
 		// val is in the form of "foo.com/bar.name=value".
 		fullName, stringValue, found := strings.Cut(val, "=")
 		if !found {
-			return // invalid
+			continue // invalid
 		}
 
 		// fullName is "foo.com/bar.name"
@@ -69,15 +73,15 @@ func computeLinkerVariableStrings(pkg *types.Package) (map[*types.Var]string, er
 
 		// Note that package main always has import path "main" as part of a build.
 		if path != pkg.Path() && (path != "main" || pkg.Name() != "main") {
-			return // not the current package
+			continue // not the current package
 		}
 
 		obj, _ := pkg.Scope().Lookup(name).(*types.Var)
 		if obj == nil {
-			return // no such variable; skip
+			continue // no such variable; skip
 		}
 		linkerVariableStrings[obj] = stringValue
-	})
+	}
 	return linkerVariableStrings, nil
 }
 
@@ -104,80 +108,55 @@ func typecheck(pkgPath string, files []*ast.File, origImporter importerWithMap) 
 	return pkg, info, err
 }
 
+// computeFieldToStruct visits every reachable type after typechecking a package
+// to map from a struct field back to its containing struct type.
+// We only record uninstantiated or "origin" fields and types,
+// given that a generic type and its instance must share names.
+//
+// Since types can be recursive, we need a map to avoid cycles.
+// We only need to track named types as done, as all cycles must use them.
 func computeFieldToStruct(info *types.Info) map[*types.Var]*types.Struct {
 	done := make(map[*types.Named]bool)
 	fieldToStruct := make(map[*types.Var]*types.Struct)
 
-	// Run recordType on all types reachable via types.Info.
-	// A bit hacky, but I could not find an easier way to do this.
-	for _, obj := range info.Uses {
-		if obj != nil {
-			recordType(obj.Type(), nil, done, fieldToStruct)
-		}
-	}
-	for _, obj := range info.Defs {
-		if obj != nil {
-			recordType(obj.Type(), nil, done, fieldToStruct)
-		}
-	}
+	// Run recordType on all types reachable via [types.Info].
 	for _, tv := range info.Types {
-		recordType(tv.Type, nil, done, fieldToStruct)
+		recordFieldToStruct(tv.Type, done, fieldToStruct)
 	}
 	return fieldToStruct
 }
 
-// recordType visits every reachable type after typechecking a package.
-// Right now, all it does is fill the fieldToStruct map.
-// Since types can be recursive, we need a map to avoid cycles.
-// We only need to track named types as done, as all cycles must use them.
-func recordType(used, origin types.Type, done map[*types.Named]bool, fieldToStruct map[*types.Var]*types.Struct) {
-	used = types.Unalias(used)
-	if origin == nil {
-		origin = used
-	} else {
-		origin = types.Unalias(origin)
-		// origin may be a [*types.TypeParam].
-		// For now, we haven't found a need to recurse in that case.
-		// We can edit this code in the future if we find an example,
-		// because we panic if a field is not in fieldToStruct.
-		if _, ok := origin.(*types.TypeParam); ok {
-			return
-		}
-	}
-	type Container interface{ Elem() types.Type }
-	switch used := used.(type) {
-	case Container:
-		recordType(used.Elem(), origin.(Container).Elem(), done, fieldToStruct)
+func recordFieldToStruct(typ types.Type, done map[*types.Named]bool, fieldToStruct map[*types.Var]*types.Struct) {
+	switch typ := typ.(type) {
+	case interface{ Elem() types.Type }:
+		recordFieldToStruct(typ.Elem(), done, fieldToStruct)
+	case *types.Alias:
+		recordFieldToStruct(typ.Rhs(), done, fieldToStruct)
 	case *types.Named:
-		if done[used] {
+		if done[typ] {
 			return
 		}
-		done[used] = true
-		// If we have a generic struct like
-		//
-		//	type Foo[T any] struct { Bar T }
-		//
-		// then we want the hashing to use the original "Bar T",
-		// because otherwise different instances like "Bar int" and "Bar bool"
-		// will result in different hashes and the field names will break.
-		// Ensure we record the original generic struct, if there is one.
-		recordType(used.Underlying(), used.Origin().Underlying(), done, fieldToStruct)
+		done[typ] = true
+		recordFieldToStruct(typ.Origin().Underlying(), done, fieldToStruct)
 	case *types.Struct:
-		origin := origin.(*types.Struct)
-		for i := range used.NumFields() {
-			field := used.Field(i)
-			originField := field.Origin()
-			// Similarly to the Named case above, if we have an anonymous
-			// struct inside a generic function like
-			//
-			//	func foo[T any]() struct { Bar T }
-			//
-			// then we want the hashing to use the original "Bar T".
-			if originField == field || fieldToStruct[originField] == nil {
-				fieldToStruct[originField] = origin
+		for field := range typ.Fields() {
+			if field != field.Origin() {
+				// Part of this struct is instantiated; do not record it at all.
+				// TODO: can we discard these types earlier on in the recursion?
+				return
+			}
+		}
+		for field := range typ.Fields() {
+			prev := fieldToStruct[field]
+			if prev == nil {
+				fieldToStruct[field] = typ
+			} else if prev != typ {
+				// If this struct field is already done, ensure we got the same result.
+				// If we didn't, then this is most likely a bug we need to fix.
+				panic(fmt.Sprintf("inconsistent fieldToStruct results: %s vs %s", prev, typ))
 			}
 			if field.Embedded() {
-				recordType(field.Type(), origin.Field(i).Type(), done, fieldToStruct)
+				recordFieldToStruct(field.Type(), done, fieldToStruct)
 			}
 		}
 	}
@@ -279,7 +258,7 @@ type transformer struct {
 	linkerVariableStrings map[*types.Var]string
 
 	// fieldToStruct helps locate struct types from any of their field
-	// objects. Useful when obfuscating field names.
+	// objects. Useful when obfuscating field names. See [computeFieldToStruct].
 	fieldToStruct map[*types.Var]*types.Struct
 
 	// obfRand is initialized by transformCompile and used during obfuscation.
@@ -319,10 +298,36 @@ func (tf *transformer) transformAsm(args []string) ([]string, error) {
 	// obfuscated source files and reuse them to avoid work.
 	newPaths := make([]string, 0, len(paths))
 	if !slices.Contains(args, "-gensymabis") {
+		// Replace go_asm.h constant names; see [saveGoAsmNames].
+		// This can't be done in the gensymabis pass as the compiler hasn't run by then.
+		var replacer *strings.Replacer
+		if nameMap := loadGoAsmNames(tf.curPkg); len(nameMap) > 0 {
+			// Note that we sort the names from longest to shortest,
+			// so that a shorter name doesn't match a prefix of a longer one.
+			origNames := slices.SortedFunc(maps.Keys(nameMap), func(a, b string) int {
+				return cmp.Compare(len(b), len(a))
+			})
+			pairs := make([]string, 0, 2*len(nameMap))
+			for _, orig := range origNames {
+				pairs = append(pairs, orig, nameMap[orig])
+			}
+			replacer = strings.NewReplacer(pairs...)
+		}
 		for _, path := range paths {
 			name := hashWithPackage(tf.curPkg, filepath.Base(path)) + ".s"
 			pkgDir := filepath.Join(sharedTempDir, tf.curPkg.obfuscatedSourceDir())
 			newPath := filepath.Join(pkgDir, name)
+			if replacer != nil {
+				content, err := os.ReadFile(newPath)
+				if err != nil {
+					return nil, err
+				}
+				if new := replacer.Replace(string(content)); new != string(content) {
+					if err := os.WriteFile(newPath, []byte(new), 0o666); err != nil {
+						return nil, err
+					}
+				}
+			}
 			newPaths = append(newPaths, newPath)
 		}
 		return append(flags, newPaths...), nil
@@ -454,6 +459,75 @@ func (tf *transformer) transformAsm(args []string) ([]string, error) {
 	}
 
 	return append(flags, newPaths...), nil
+}
+
+// saveGoAsmNames saves go_asm.h constant name mappings to the build cache;
+// see https://go.dev/doc/asm#data-offsets.
+func (tf *transformer) saveGoAsmNames() error {
+	nameMap := make(map[string]string) // original -> obfuscated
+	scope := tf.pkg.Scope()
+	for _, name := range scope.Names() {
+		obj := scope.Lookup(name)
+		tn, ok := obj.(*types.TypeName)
+		if !ok {
+			continue
+		}
+		strct, ok := tn.Type().Underlying().(*types.Struct)
+		if !ok {
+			continue
+		}
+		obfTypeName := hashWithPackage(tf.curPkg, name)
+		nameMap[name+"__size"] = obfTypeName + "__size"
+		for field := range strct.Fields() {
+			obfFieldName := hashWithStruct(strct, field)
+			nameMap[name+"_"+field.Name()] = obfTypeName + "_" + obfFieldName
+		}
+	}
+	if len(nameMap) == 0 {
+		return nil
+	}
+	fsCache, err := openCache()
+	if err != nil {
+		return err
+	}
+	// TODO: if we end up with an "obfuscated name map" artifact per package,
+	// then use that directly.
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(nameMap); err != nil {
+		return err
+	}
+	return fsCache.PutBytes(goAsmCacheID(tf.curPkg.GarbleActionID), buf.Bytes())
+}
+
+func goAsmCacheID(garbleActionID [sha256.Size]byte) [sha256.Size]byte {
+	hasher := sha256.New()
+	hasher.Write(garbleActionID[:])
+	hasher.Write([]byte("\x00go-asm-names-v1\x00"))
+	var sum [sha256.Size]byte
+	hasher.Sum(sum[:0])
+	return sum
+}
+
+// loadGoAsmNames loads the go_asm.h name mapping saved by [transformer.saveGoAsmNames].
+func loadGoAsmNames(lpkg *listedPackage) map[string]string {
+	fsCache, err := openCache()
+	if err != nil {
+		return nil
+	}
+	filename, _, err := fsCache.GetFile(goAsmCacheID(lpkg.GarbleActionID))
+	if err != nil {
+		return nil
+	}
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var nameMap map[string]string
+	if err := gob.NewDecoder(f).Decode(&nameMap); err != nil {
+		return nil
+	}
+	return nameMap
 }
 
 func (tf *transformer) replaceAsmNames(buf *bytes.Buffer, remaining []byte) {
@@ -688,6 +762,12 @@ func (tf *transformer) transformCompile(args []string) ([]string, error) {
 		}
 	}
 
+	if len(tf.curPkg.SFiles) > 0 && tf.curPkg.ToObfuscate {
+		if err := tf.saveGoAsmNames(); err != nil {
+			return nil, err
+		}
+	}
+
 	flags = alterTrimpath(flags)
 	newImportCfg, err := tf.processImportCfg(flags, requiredPkgs)
 	if err != nil {
@@ -751,62 +831,75 @@ func (tf *transformer) transformCompile(args []string) ([]string, error) {
 	return append(flags, newPaths...), nil
 }
 
-// transformDirectives rewrites //go:linkname toolchain directives in comments
-// to replace names with their obfuscated versions.
+// transformDirectives rewrites toolchain directives in comments to replace
+// local names with their obfuscated versions.
 func (tf *transformer) transformDirectives(comments []*ast.CommentGroup) error {
 	for _, group := range comments {
 		for _, comment := range group.List {
-			if !strings.HasPrefix(comment.Text, "//go:linkname ") {
-				continue
-			}
-
-			// We can have either just one argument:
-			//
-			//	//go:linkname localName
-			//
-			// Or two arguments, where the second may refer to a name in a
-			// different package:
-			//
-			//	//go:linkname localName newName
-			//	//go:linkname localName pkg.newName
-			fields := strings.Fields(comment.Text)
-			localName := fields[1]
-			newName := ""
-			if len(fields) == 3 {
-				newName = fields[2]
-			}
-			switch newName {
-			case "runtime.lastmoduledatap", "runtime.moduledataverify1":
-				// Linknaming to the var and function above is used by github.com/bytedance/sonic/loader
-				// to inject functions into the runtime, but that breaks as garble patches
-				// the runtime to change the function header magic number.
+			switch {
+			case strings.HasPrefix(comment.Text, "//go:linkname "):
+				// We can have either just one argument:
 				//
-				// Given that Go is locking down access to runtime internals via go:linkname,
-				// and what sonic does was never supported and is a hack,
-				// refuse to build before the user sees confusing run-time panics.
-				return fmt.Errorf("garble does not support packages with a //go:linkname to %s", newName)
-			}
+				//	//go:linkname localName
+				//
+				// Or two arguments, where the second may refer to a name in a
+				// different package:
+				//
+				//	//go:linkname localName newName
+				//	//go:linkname localName pkg.newName
+				fields := strings.Fields(comment.Text)
+				localName := fields[1]
+				newName := ""
+				if len(fields) == 3 {
+					newName = fields[2]
+				}
+				switch newName {
+				case "runtime.lastmoduledatap", "runtime.moduledataverify1":
+					// Linknaming to the var and function above is used by github.com/bytedance/sonic/loader
+					// to inject functions into the runtime, but that breaks as garble patches
+					// the runtime to change the function header magic number.
+					//
+					// Given that Go is locking down access to runtime internals via go:linkname,
+					// and what sonic does was never supported and is a hack,
+					// refuse to build before the user sees confusing run-time panics.
+					return fmt.Errorf("garble does not support packages with a //go:linkname to %s", newName)
+				}
 
-			localName, newName = tf.transformLinkname(localName, newName)
-			fields[1] = localName
-			if len(fields) == 3 {
-				fields[2] = newName
-			}
+				localName, newName = tf.transformLinkname(localName, newName)
+				fields[1] = localName
+				if len(fields) == 3 {
+					fields[2] = newName
+				}
 
-			if flagDebug { // TODO(mvdan): remove once https://go.dev/issue/53465 if fixed
-				log.Printf("linkname %q changed to %q", comment.Text, strings.Join(fields, " "))
+				if flagDebug { // TODO(mvdan): remove once https://go.dev/issue/53465 if fixed
+					log.Printf("linkname %q changed to %q", comment.Text, strings.Join(fields, " "))
+				}
+				comment.Text = strings.Join(fields, " ")
+			case strings.HasPrefix(comment.Text, "//go:cgo_import_dynamic "),
+				strings.HasPrefix(comment.Text, "//go:cgo_import_static "):
+				fields := strings.Fields(comment.Text)
+				if len(fields) < 2 {
+					continue
+				}
+				if localNamePart, ok := strings.CutPrefix(fields[1], tf.curPkg.ImportPath+"."); ok {
+					fields[1] = tf.curPkg.obfuscatedImportPath() + "." + tf.directiveLocalName(localNamePart)
+				}
+				comment.Text = strings.Join(fields, " ")
 			}
-			comment.Text = strings.Join(fields, " ")
 		}
 	}
 	return nil
 }
 
-func (tf *transformer) transformLinkname(localName, newName string) (string, string) {
-	// obfuscate the local name, if the current package is obfuscated
+func (tf *transformer) directiveLocalName(localName string) string {
 	if tf.curPkg.ToObfuscate && !compilerIntrinsics[tf.curPkg.ImportPath][localName] {
-		localName = hashWithPackage(tf.curPkg, localName)
+		return hashWithPackage(tf.curPkg, localName)
 	}
+	return localName
+}
+
+func (tf *transformer) transformLinkname(localName, newName string) (string, string) {
+	localName = tf.directiveLocalName(localName)
 	if newName == "" {
 		return localName, ""
 	}
@@ -1341,11 +1434,11 @@ func (tf *transformer) transformLink(args []string) ([]string, error) {
 	// Make sure -X works with obfuscated identifiers.
 	// To cover both obfuscated and non-obfuscated names,
 	// duplicate each flag with a obfuscated version.
-	flagValueIter(flags, "-X", func(val string) {
+	for val := range flagValues(flags, "-X") {
 		// val is in the form of "foo.com/bar.name=value".
 		fullName, stringValue, found := strings.Cut(val, "=")
 		if !found {
-			return // invalid
+			continue // invalid
 		}
 
 		// fullName is "foo.com/bar.name"
@@ -1362,11 +1455,11 @@ func (tf *transformer) transformLink(args []string) ([]string, error) {
 			// We couldn't find the package.
 			// Perhaps a typo, perhaps not part of the build.
 			// cmd/link ignores those, so we should too.
-			return
+			continue
 		}
 		newName := hashWithPackage(lpkg, name)
 		flags = append(flags, fmt.Sprintf("-X=%s.%s=%s", lpkg.obfuscatedImportPath(), newName, stringValue))
-	})
+	}
 
 	// Starting in Go 1.17, Go's version is implicitly injected by the linker.
 	// It's the same method as -X, so we can override it with an extra flag.
