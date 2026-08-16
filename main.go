@@ -159,10 +159,18 @@ func main() {
 				panic(err)
 			}
 		}
-		if os.Getenv("GARBLE_WRITE_ALLOCS") == "true" {
+		if dir := os.Getenv("GARBLE_WRITE_ALLOCS"); dir != "" {
 			var memStats runtime.MemStats
 			runtime.ReadMemStats(&memStats)
-			fmt.Fprintf(os.Stderr, "garble allocs: %d\n", memStats.Mallocs)
+			f, err := os.CreateTemp(dir, "garble-allocs-*.txt")
+			if err != nil {
+				panic(err)
+			}
+			// The alloc count followed by the total bytes allocated.
+			fmt.Fprintf(f, "%d %d\n", memStats.Mallocs, memStats.TotalAlloc)
+			if err := f.Close(); err != nil {
+				panic(err)
+			}
 		}
 	}()
 	flagSet.Parse(os.Args[1:])
@@ -229,6 +237,8 @@ func mainErr(args []string) error {
 		return nil
 	case "reverse":
 		return commandReverse(args)
+	case "map":
+		return commandMap(args)
 	case "bug":
 		return commandBug(args)
 	case "build", "test", "run":
@@ -281,7 +291,7 @@ func mainErr(args []string) error {
 			}
 			var tf transformer
 			toolexecImportPath := os.Getenv("TOOLEXEC_IMPORTPATH")
-			tf.curPkg = sharedCache.ListedPackages[toolexecImportPath]
+			tf.curPkg, _ = sharedCache.ListedPackages.get(toolexecImportPath)
 			if tf.curPkg == nil {
 				return fmt.Errorf("TOOLEXEC_IMPORTPATH package not found in listed packages: %s", toolexecImportPath)
 			}
@@ -307,9 +317,9 @@ func mainErr(args []string) error {
 			executablePath = modifiedLinkPath
 			os.Setenv(linker.MagicValueEnv, strconv.FormatUint(uint64(magicValue()), 10))
 			os.Setenv(linker.EntryOffKeyEnv, strconv.FormatUint(uint64(entryOffKey()), 10))
-			if flagTiny {
-				os.Setenv(linker.TinyEnv, "true")
-			}
+			// Do not allow a value inherited from the caller to select tiny
+			// linker behavior for a regular build.
+			os.Setenv(linker.TinyEnv, strconv.FormatBool(flagTiny))
 
 			log.Printf("replaced linker with: %s", executablePath)
 		}
@@ -352,8 +362,8 @@ This command wraps "go %s". Below is its help:
 	}
 
 	// Here is the only place we initialize the cache.
-	// The sub-processes will parse it from a shared gob file.
-	sharedCache = &sharedCacheType{}
+	// The sub-processes will parse it from a shared file.
+	sharedCache = &sharedCacheType{ListedPackages: newListedPackages()}
 
 	// Note that we also need to pass build flags to 'go list', such
 	// as -tags.
@@ -585,6 +595,7 @@ The following commands are supported:
 	test           replace "go test"
 	run            replace "go run"
 	reverse        de-obfuscate output such as stack traces
+	map            describe how names are obfuscated, as JSON
 	bug            start a bug report
 	version        print the version and build settings of the garble binary
 
@@ -625,6 +636,17 @@ func filterForwardBuildFlags(flags []string) (filtered []string, firstUnknown st
 		}
 	}
 	return filtered, firstUnknown
+}
+
+// rejectUnknownBuildFlags errors on the first non-build flag in flags, if any.
+// Inspect-only commands like reverse and map don't run a real Go command, so
+// without this check they would silently ignore such flags.
+func rejectUnknownBuildFlags(flags []string) error {
+	if _, firstUnknown := filterForwardBuildFlags(flags); firstUnknown != "" {
+		// A bit of a hack to get a normal flag.Parse error.
+		return flag.NewFlagSet("", flag.ContinueOnError).Parse([]string{firstUnknown})
+	}
+	return nil
 }
 
 // splitFlagsFromFiles splits args into a list of flag and file arguments. Since

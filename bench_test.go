@@ -54,7 +54,7 @@ func BenchmarkBuild(b *testing.B) {
 	tdir := b.TempDir()
 
 	// We collect extra metrics.
-	var memoryAllocs, cachedTime, systemTime int64
+	var memoryAllocs, memoryBytes, cachedTime, systemTime int64
 
 	outputBin := filepath.Join(tdir, "output")
 	sourceDir := filepath.Join(tdir, "src")
@@ -67,7 +67,34 @@ func BenchmarkBuild(b *testing.B) {
 	writeSourceFile("go.mod", []byte("module test/main"))
 	writeSourceFile("main.go", benchSourceMain)
 
-	rxGarbleAllocs := regexp.MustCompile(`(?m)^garble allocs: ([0-9]+)`)
+	// Each garble sub-process writes its alloc count and total allocated bytes
+	// to a file in this dir. We read them from files rather than from stderr:
+	// cmd/go replays a cached action's stored stderr on the incremental rebuild,
+	// which would double-count the allocs from the initial build.
+	allocsDir := filepath.Join(tdir, "allocs")
+
+	// sumAllocFiles returns the alloc counts and allocated bytes written since
+	// the dir was last reset, and resets it for the next build.
+	sumAllocFiles := func() (allocs, allocBytes, count int64) {
+		entries, err := os.ReadDir(allocsDir)
+		qt.Assert(b, qt.IsNil(err))
+		for _, entry := range entries {
+			data, err := os.ReadFile(filepath.Join(allocsDir, entry.Name()))
+			qt.Assert(b, qt.IsNil(err))
+			fields := strings.Fields(string(data))
+			qt.Assert(b, qt.Equals(len(fields), 2))
+			a, err := strconv.ParseInt(fields[0], 10, 64)
+			qt.Assert(b, qt.IsNil(err))
+			by, err := strconv.ParseInt(fields[1], 10, 64)
+			qt.Assert(b, qt.IsNil(err))
+			allocs += a
+			allocBytes += by
+			count++
+		}
+		qt.Assert(b, qt.IsNil(os.RemoveAll(allocsDir)))
+		qt.Assert(b, qt.IsNil(os.Mkdir(allocsDir, 0o777)))
+		return allocs, allocBytes, count
+	}
 
 	b.ResetTimer()
 	b.StopTimer()
@@ -80,11 +107,13 @@ func BenchmarkBuild(b *testing.B) {
 		garbleCache := filepath.Join(tdir, "garble-cache")
 		qt.Assert(b, qt.IsNil(os.RemoveAll(garbleCache)))
 		qt.Assert(b, qt.IsNil(os.Mkdir(garbleCache, 0o777)))
+		qt.Assert(b, qt.IsNil(os.RemoveAll(allocsDir)))
+		qt.Assert(b, qt.IsNil(os.Mkdir(allocsDir, 0o777)))
 		env := []string{
 			"RUN_GARBLE_MAIN=true",
 			"GOCACHE=" + goCache,
 			"GARBLE_CACHE=" + garbleCache,
-			"GARBLE_WRITE_ALLOCS=true",
+			"GARBLE_WRITE_ALLOCS=" + allocsDir,
 		}
 		if prof := flag.Lookup("test.cpuprofile").Value.String(); prof != "" {
 			// Ensure the directory is empty and created, and pass it along, so that the garble
@@ -142,23 +171,21 @@ func BenchmarkBuild(b *testing.B) {
 			}
 			qt.Assert(b, qt.IsTrue(rxBuiltMain.Match(out)))
 
-			matches := rxGarbleAllocs.FindAllSubmatch(out, -1)
+			allocs, allocBytes, procCount := sumAllocFiles()
 			if !cached {
 				// The non-cached version should have at least a handful of
 				// sub-processes; catch if our logic breaks.
-				qt.Assert(b, qt.IsTrue(len(matches) > 5))
+				qt.Assert(b, qt.IsTrue(procCount > 5))
 			}
-			for _, match := range matches {
-				allocs, err := strconv.ParseInt(string(match[1]), 10, 64)
-				qt.Assert(b, qt.IsNil(err))
-				memoryAllocs += allocs
-			}
+			memoryAllocs += allocs
+			memoryBytes += allocBytes
 
 			systemTime += int64(cmd.ProcessState.SystemTime())
 		}
 	}
-	// We can't use "allocs/op" as it's reserved for ReportAllocs.
+	// We can't use "allocs/op" nor "B/op" as they're reserved for ReportAllocs.
 	b.ReportMetric(float64(memoryAllocs)/float64(b.N), "mallocs/op")
+	b.ReportMetric(float64(memoryBytes)/float64(b.N), "alloc-B/op")
 	b.ReportMetric(float64(cachedTime)/float64(b.N), "cached-ns/op")
 	b.ReportMetric(float64(systemTime)/float64(b.N), "sys-ns/op")
 	info, err := os.Stat(outputBin)

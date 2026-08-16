@@ -77,8 +77,15 @@ func (h typeutil_hasher) hash(t types.Type) uint32 {
 			}
 			// NOTE(garble): we must not hash struct field tags, as they do not affect type identity.
 			// hash += typeutil_hashString(t.Tag(i))
-			hash += typeutil_hashString(f.Name()) // (ignore f.Pkg)
-			hash += h.hash(f.Type())
+			//
+			// NOTE(garble): unlike upstream, we fold in the field position rather
+			// than the field type, as this salt obfuscates field names (see
+			// hashWithStruct) and must be stable across instantiations: an anonymous
+			// struct{F Q} returned by a generic function has no origin to recover Q,
+			// so a consuming package only sees an instantiation such as struct{F int}.
+			// Positions still keep reordered structs distinct without the type.
+			// hash += h.hash(f.Type())
+			hash += (1 + uint32(i)) * typeutil_hashString(f.Name()) // (ignore f.Pkg)
 		}
 		return hash
 
