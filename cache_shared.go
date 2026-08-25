@@ -229,25 +229,17 @@ func loadSharedCache() error {
 	return nil
 }
 
-// saveSharedCache creates a temporary directory to share between garble processes.
-// This directory also includes the msgp-encoded cache global.
-func saveSharedCache() (string, error) {
+// saveSharedCache writes the msgp-encoded cache global into sharedTempDir,
+// the temporary directory shared between garble processes.
+func saveSharedCache() error {
 	if sharedCache == nil {
 		panic("saving a missing cache?")
 	}
-	dir, err := os.MkdirTemp("", "garble-shared")
-	if err != nil {
-		return "", err
-	}
-
 	data, err := sharedCache.MarshalMsg(nil)
 	if err != nil {
-		return "", err
+		return err
 	}
-	if err := writeFileExclusive(filepath.Join(dir, sharedCacheFilename), data); err != nil {
-		return "", err
-	}
-	return dir, nil
+	return writeFileExclusive(filepath.Join(sharedTempDir, sharedCacheFilename), data)
 }
 
 func createExclusive(name string) (*os.File, error) {
@@ -468,6 +460,13 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 		// Fold in the linknamed packages so each compile subprocess finds them
 		// in the shared cache instead of spawning its own `go list`. `go list`
 		// dedups them against the deps and `-mod` flags are harmless for std.
+		//
+		// They need -export like any other package, even though we never read
+		// their export data; it is the only way `go list` gives us a build ID
+		// to derive [listedPackage.GarbleActionID] from. Salting them by import
+		// path instead would make a package's hashed names depend on which
+		// packages the build includes, which Go's build cache does not key on,
+		// so two builds would disagree on a linkname's target and fail to link.
 		packages = append(packages, linknamedToList()...)
 	}
 
@@ -533,10 +532,8 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 		if sharedCache.ListedPackages.has(pkg.ImportPath) {
 			return fmt.Errorf("duplicate package: %q", pkg.ImportPath)
 		}
-		if pkg.BuildID != "" {
-			actionID := decodeBuildIDHash(splitActionID(pkg.BuildID))
-			pkg.GarbleActionID = addGarbleToHash(actionID)
-		}
+		// Note that GarbleActionID is filled by toolexecCmd once the listing
+		// is done, as hashing it needs garble's own content ID.
 
 		// Decide ToObfuscate as we read each package, to avoid a second pass
 		// that would force a full decode of the lazy map in sub-processes.
@@ -568,9 +565,6 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 
 			pkg.ToObfuscate = true
 			anyToObfuscate = true
-			if len(pkg.GarbleActionID) == 0 {
-				return fmt.Errorf("package %q to be obfuscated lacks build id?", pkg.ImportPath)
-			}
 		}
 
 		sharedCache.ListedPackages.set(pkg.ImportPath, &pkg)
@@ -607,6 +601,21 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 var ErrNotFound = errors.New("not found")
 
 var ErrNotDependency = errors.New("not a dependency")
+
+// implicitLinkerDeps are the packages which the go command adds to main
+// packages on behalf of the linker, depending on the target platform and build
+// flags. They are never in a package's Imports, so any package may refer to
+// them and to their dependencies.
+// Keep in sync with cmd/go/internal/load.LinkerDeps.
+var implicitLinkerDeps = [...]string{
+	"runtime",          // always
+	"runtime/cgo",      // external linking
+	"math",             // GOARCH=arm
+	"runtime/race",     // -race
+	"runtime/msan",     // -msan
+	"runtime/asan",     // -asan
+	"runtime/coverage", // -cover
+}
 
 // listPackage gets the listedPackage information for a certain package
 func listPackage(from *listedPackage, path string) (*listedPackage, error) {
@@ -655,15 +664,18 @@ func listPackage(from *listedPackage, path string) (*listedPackage, error) {
 		return nil, fmt.Errorf("list %s: %w", path, ErrNotFound)
 	}
 
-	// As a special case, any package can list runtime or its dependencies,
-	// since those are always an implicit dependency.
-	// We need to handle this ourselves as runtime does not appear in Deps.
+	// As a special case, any package can list an implicit linker dependency
+	// or one of its dependencies.
+	// We need to handle this ourselves as they do not appear in Imports.
 	// TODO: it might be faster to bring back a "runtimeAndDeps" map or func.
-	if pkg.ImportPath == "runtime" {
-		return pkg, nil
-	}
-	if runtimePkg, _ := sharedCache.ListedPackages.get("runtime"); runtimePkg.hasDep(pkg.ImportPath) {
-		return pkg, nil
+	for _, implicit := range implicitLinkerDeps {
+		if pkg.ImportPath == implicit {
+			return pkg, nil
+		}
+		// Only runtime is guaranteed to be listed.
+		if implicitPkg, ok := sharedCache.ListedPackages.get(implicit); ok && implicitPkg.hasDep(pkg.ImportPath) {
+			return pkg, nil
+		}
 	}
 
 	return nil, fmt.Errorf("list %s: %w", path, ErrNotDependency)

@@ -258,6 +258,9 @@ func mainErr(args []string) error {
 				}
 			}
 		}()
+		// Deferred calls run in reverse order, so this waits before the cleanup
+		// above removes the directory the linker is being built in.
+		defer waitForPatchedLinker()
 		if err != nil {
 			return err
 		}
@@ -336,6 +339,38 @@ func mainErr(args []string) error {
 	}
 }
 
+// patchedLinkerDone is closed once startPatchingLinker's work has finished.
+var patchedLinkerDone chan struct{}
+
+// startPatchingLinker prepares the patched linker in the background, so that the
+// link step at the end of a build doesn't have to wait for it. Errors are only
+// logged, as the link step patches the linker itself and reports any error then.
+//
+// Note that we start before toolexecCmd's `go list` rather than after it, as by
+// then there is too little of the build left to overlap with.
+func startPatchingLinker() {
+	patchedLinkerDone = make(chan struct{})
+	go func() {
+		defer close(patchedLinkerDone)
+		startTime := time.Now()
+		_, unlock, err := linker.PatchLinker(sharedCache.GoEnv.GOROOT, sharedCache.GoEnv.GOVERSION, sharedCache.CacheDir, sharedTempDir)
+		if err != nil {
+			log.Printf("could not prepare the linker ahead of time: %v", err)
+			return
+		}
+		unlock()
+		log.Printf("prepared the linker in %s", debugSince(startTime))
+	}()
+}
+
+// waitForPatchedLinker waits for startPatchingLinker, which must happen before
+// the shared temporary directory it builds in is removed.
+func waitForPatchedLinker() {
+	if patchedLinkerDone != nil {
+		<-patchedLinkerDone
+	}
+}
+
 // toolexecCmd builds an *exec.Cmd which is set up for running "go <command>"
 // with -toolexec=garble and the supplied arguments.
 //
@@ -385,6 +420,18 @@ This command wraps "go %s". Below is its help:
 		return nil, err
 	}
 
+	// Obtaining garble's own content ID needs a `go tool buildid` process,
+	// which costs tens of milliseconds. Nothing below needs it until we hash
+	// the listed packages, so fetch it alongside the `go list`.
+	binaryContentID := make(chan error, 1)
+	go func() {
+		binaryBuildID, err := buildidOf(execPath)
+		if err == nil {
+			sharedCache.BinaryContentID = decodeBuildIDHash(splitContentID(binaryBuildID))
+		}
+		binaryContentID <- err
+	}()
+
 	// Always an absolute directory; defaults to e.g. "~/.cache/garble".
 	if dir := os.Getenv("GARBLE_CACHE"); dir != "" {
 		sharedCache.CacheDir, err = filepath.Abs(dir)
@@ -399,21 +446,46 @@ This command wraps "go %s". Below is its help:
 		sharedCache.CacheDir = filepath.Join(parentDir, "garble")
 	}
 
-	binaryBuildID, err := buildidOf(execPath)
-	if err != nil {
-		return nil, err
-	}
-	sharedCache.BinaryContentID = decodeBuildIDHash(splitContentID(binaryBuildID))
-
-	if err := appendListedPackages(args, true); err != nil {
-		return nil, err
-	}
-
-	sharedTempDir, err = saveSharedCache()
+	sharedTempDir, err = os.MkdirTemp("", "garble-shared")
 	if err != nil {
 		return nil, err
 	}
 	os.Setenv("GARBLE_SHARED", sharedTempDir)
+
+	// Patching and building the linker takes seconds, and the link step is the
+	// last thing a build does, so doing it lazily leaves the build waiting at
+	// the very end. Start it now instead, alongside the rest of the build.
+	// A build which never links a binary wastes this work, but only the once,
+	// as any later build reuses the cached linker in well under a millisecond.
+	// We skip the `go list` behind `garble reverse` and `garble map` entirely,
+	// as they never link, and they exit without waiting for this work,
+	// which would leave a stray `go build` running behind them.
+	if command != "list" {
+		startPatchingLinker()
+	}
+
+	if listErr := appendListedPackages(args, true); listErr != nil {
+		// A Go tool which can't be run at all fails here as well as in the
+		// background fetch above; prefer that error, as it is the root cause.
+		if err := <-binaryContentID; err != nil {
+			return nil, err
+		}
+		return nil, listErr
+	}
+
+	// Now that we have both halves, hash each package's action ID with ours.
+	if err := <-binaryContentID; err != nil {
+		return nil, err
+	}
+	for _, lpkg := range sharedCache.ListedPackages.all() {
+		if lpkg.BuildID != "" {
+			lpkg.GarbleActionID = addGarbleToHash(decodeBuildIDHash(splitActionID(lpkg.BuildID)))
+		}
+	}
+
+	if err := saveSharedCache(); err != nil {
+		return nil, err
+	}
 
 	if flagDebugDir != "" {
 		origDir := flagDebugDir
@@ -532,8 +604,8 @@ func (f *seedFlag) Set(s string) error {
 
 func goVersionOK() bool {
 	const (
-		minGoVersion  = "go1.26.0" // the minimum Go version we support; could be a bugfix release if needed
-		unsupportedGo = "go1.27"   // the first major version we don't support
+		minGoVersion  = "go1.27.0" // the minimum Go version we support; could be a bugfix release if needed
+		unsupportedGo = "go1.28"   // the first major version we don't support
 	)
 
 	toolchainVersion := sharedCache.GoEnv.GOVERSION

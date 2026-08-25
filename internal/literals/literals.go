@@ -68,69 +68,60 @@ func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkString
 					return false
 				}
 			}
+
+		case ast.Expr:
+			// Rewrite &[]byte{...} as a whole on the way down. Rewriting the
+			// composite literal on its own would leave behind &(decoder()),
+			// which is not addressable, and parentheses in the input would
+			// hide the literal from a check on the way up.
+			//
+			// See issue #520.
+			if unary, ok := node.(*ast.UnaryExpr); ok && unary.Op == token.AND {
+				if lit, ok := ast.Unparen(unary.X).(*ast.CompositeLit); ok {
+					if newNode := handleCompositeLiteral(or, true, lit, info); newNode != nil {
+						cursor.Replace(newNode)
+						return false
+					}
+				}
+			}
+
+			// The compiler folds constant expressions, so only the outermost
+			// one exists at run time. Rewrite that one and stop descending,
+			// rather than also rewriting its operands into dead decoders.
+			typeAndValue := info.Types[node]
+			if typeAndValue.Value == nil {
+				break
+			}
+			if typeAndValue.Value.Kind() != constant.String {
+				// Constants of other kinds, such as len or unsafe.Sizeof, do
+				// not evaluate their operands at all. Rewriting them would be
+				// useless, and would stop uses which require a constant, such
+				// as array lengths or keyed indexes, from compiling.
+				return false
+			}
+			if typeAndValue.Type == types.Typ[types.String] {
+				value := constant.StringVal(typeAndValue.Value)
+				if len(value) >= MinSize && len(value) <= MaxSize {
+					cursor.Replace(withPos(obfuscateString(or, value), node.Pos()))
+					return false
+				}
+			}
+			// Keep descending: a string constant we left alone, such as one
+			// above MaxSize or one of a named type, may still have operands
+			// which we can rewrite.
 		}
 		return true
 	}
 
 	post := func(cursor *astutil.Cursor) bool {
-		node, ok := cursor.Node().(ast.Expr)
-		if !ok {
-			return true
-		}
-
-		typeAndValue := info.Types[node]
-		if !typeAndValue.IsValue() {
-			return true
-		}
-
-		if typeAndValue.Type == types.Typ[types.String] && typeAndValue.Value != nil {
-			value := constant.StringVal(typeAndValue.Value)
-			if len(value) < MinSize || len(value) > MaxSize {
-				return true
-			}
-
-			cursor.Replace(withPos(obfuscateString(or, value), node.Pos()))
-
-			return true
-		}
-
-		switch node := node.(type) {
-		case *ast.UnaryExpr:
-			// Account for the possibility of address operators like
-			// &[]byte used inline with function arguments.
-			//
-			// See issue #520.
-
-			if node.Op != token.AND {
-				return true
-			}
-
-			if child, ok := node.X.(*ast.CompositeLit); ok {
-				newnode := handleCompositeLiteral(or, true, child, info)
-				if newnode != nil {
-					cursor.Replace(newnode)
-				}
-			}
-
-		case *ast.CompositeLit:
-			// We replaced the &[]byte{...} case above. Here we account for the
-			// standard []byte{...} or [4]byte{...} value form.
-			//
-			// We need two separate calls to cursor.Replace, as it only supports
-			// replacing the node we're currently visiting, and the pointer variant
-			// requires us to move the ampersand operator.
-
-			parent, ok := cursor.Parent().(*ast.UnaryExpr)
-			if ok && parent.Op == token.AND {
-				return true
-			}
-
-			newnode := handleCompositeLiteral(or, false, node, info)
-			if newnode != nil {
-				cursor.Replace(newnode)
+		// Here we handle the plain []byte{...} or [4]byte{...} value form.
+		// The pointer form was already replaced on the way down; a literal
+		// which we declined there is declined here just the same.
+		if lit, ok := cursor.Node().(*ast.CompositeLit); ok {
+			if newNode := handleCompositeLiteral(or, false, lit, info); newNode != nil {
+				cursor.Replace(newNode)
 			}
 		}
-
 		return true
 	}
 

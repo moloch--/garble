@@ -3,7 +3,11 @@
 Thank you for your interest in contributing! Here are some ground rules:
 
 1. The tool's design decisions are in the [README](README.md)
-2. New features or major changes should be opened as an issue first
+2. Always file an issue before sending a PR: a bug report for a fix, or a
+   feature request for anything new. Discussing the problem first is the best
+   way to agree on whether and how it should be solved, so that your work is
+   not wasted. PRs without an issue may be closed in favor of one, with the
+   exception of trivial fixes such as typos.
 3. All contributions are done in PRs with at least one review and CI
 4. All changes that alter behavior (features, flags, bugs) need a test
 5. We use the `#obfuscation` channel over at the [Gophers Slack](https://invite.slack.golangbridge.org/) to chat
@@ -104,32 +108,6 @@ compiling a package or linking binary. The first component is the *action ID*,
 the hash of the operation's inputs, and the last component is the *content ID*,
 the hash of the operation's output. For more, read
 [the docs in buildid.go](https://github.com/golang/go/blob/master/src/cmd/go/internal/work/buildid.go)
-
-### Bundled x/tools packages
-
-`bundled_typeutil.go` and `bundled_typeparams.go` are modified copies of x/tools packages.
-We need to modify [typeutil.Hasher](https://pkg.go.dev/golang.org/x/tools/go/types/typeutil#Hasher)
-so that it doesn't include struct field tags in the hash algorithm,
-given that struct field tags do not affect type identity.
-
-The typeutil package imports the internal `typeparams` package, so we must bundle that too,
-and replace the import with references to the bundled typeparams file.
-
-Our patches are marked via `// NOTE(garble)` and are done by hand.
-We also remove the `//go:generate` lines added by `bundle`
-because re-running the tool will undo the manual edits.
-
-Finally, we also remove any bundled API we don't need, that is,
-anything which is not reachable from the bundled `typeutil_Hasher` type.
-We also ensure that `staticcheck` does not report any unused code.
-
-To update these files to a newer x/tools version to gain upstream fixes:
-
-* `go get golang.org/x/tools@latest`
-* `go tool bundle -o bundled_typeutil.go golang.org/x/tools/go/types/typeutil`
-* `go tool bundle -o bundled_typeparams.go golang.org/x/tools/internal/typeparams`
-* re-apply the changes mentioned above
-* inspect the diff to ensure the changes look reasonable and we haven't lost any of our edits
 
 ### Benchmarking
 

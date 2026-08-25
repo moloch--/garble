@@ -6,6 +6,16 @@ exec ./main
 cmp stdout main.stdout
 ! binsubstr main$exe 'PortedField' 'test/main'
 
+# Linking externally must not leave the C toolchain's build ID behind either.
+[linux] [exec:readelf] exec readelf --wide --section-headers main$exe
+[linux] [exec:readelf] ! stdout '\.note\.gnu\.build-id'
+
+# Linking externally pulls in runtime/cgo even for a main package which does
+# not use cgo at all, so garble must accept it as a dependency.
+exec garble build -ldflags=-linkmode=external -o=nocgobin$exe ./nocgo
+exec ./nocgobin$exe
+stderr 'hello from nocgo'
+
 [short] stop # no need to verify this with -short
 
 # Ensure that reversing works with cgo.
@@ -43,6 +53,11 @@ func main() {
 	imported.RegularFunc()
 	cgoFunc()
 }
+
+-- nocgo/main.go --
+package main
+
+func main() { println("hello from nocgo") }
 
 -- imported/imported_regular.go --
 package imported

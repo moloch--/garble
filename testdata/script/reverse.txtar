@@ -1,6 +1,10 @@
 # Unknown build flags should result in errors.
 ! exec garble reverse -badflag=foo .
 stderr 'flag provided but not defined'
+# Reverse never links, so it must not patch and build the linker in the
+# background; such a build would outlive garble and litter the temporary dir.
+# Note that we rely on the unix-like TMPDIR env var name.
+[!windows] ! grepfiles ${TMPDIR} 'go-build'
 
 exec garble build
 exec ./main

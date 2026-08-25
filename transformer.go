@@ -564,6 +564,28 @@ func loadGoAsmNames(lpkg *listedPackage) map[string]string {
 	return nameMap
 }
 
+// toolchainNameDependencies holds declarations whose exact symbol names the Go
+// runtime consumes, even though they are neither compiler intrinsics nor
+// linkname targets. Like [compilerIntrinsics], their package path and name must
+// both survive obfuscation, so [isToolchainNameDependency] gates the four sites
+// below that already exempted intrinsics.
+//
+// runtime.stkframe.argMapInternal matches these reflect assembly stubs by name
+// to synthesize their dynamic argument maps while the garbage collector scans a
+// stack; renaming either stub can make a live pointer appear to be freed. Tiny
+// mode preserves the same names at link time; see the patch under
+// internal/linker/patches.
+var toolchainNameDependencies = map[string]map[string]bool{
+	"reflect": {
+		"makeFuncStub":    true,
+		"methodValueCall": true,
+	},
+}
+
+func isToolchainNameDependency(path, name string) bool {
+	return compilerIntrinsics[path][name] || toolchainNameDependencies[path][name]
+}
+
 func (tf *transformer) replaceAsmNames(buf *bytes.Buffer, remaining []byte) {
 	// We need to replace all function references with their obfuscated name
 	// counterparts.
@@ -666,7 +688,7 @@ func (tf *transformer) replaceAsmNames(buf *bytes.Buffer, remaining []byte) {
 		name := string(remaining[:nameEnd])
 		remaining = remaining[nameEnd:]
 
-		if lpkg.ToObfuscate && !compilerIntrinsics[lpkg.ImportPath][name] {
+		if lpkg.ToObfuscate && !isToolchainNameDependency(lpkg.ImportPath, name) {
 			newName := hashWithPackage(lpkg, name)
 			if flagDebug { // TODO(mvdan): remove once https://go.dev/issue/53465 if fixed
 				log.Printf("asm name %q hashed with %x to %q", name, tf.curPkg.GarbleActionID, newName)
@@ -839,6 +861,9 @@ func (tf *transformer) transformCompile(args []string) ([]string, error) {
 				updateMagicValue(file, magicValue())
 			}
 		}
+		if flagTiny {
+			stripFatalMessages(tf.curPkg.ImportPath, file)
+		}
 		if err := tf.transformDirectives(file.Comments); err != nil {
 			return nil, err
 		}
@@ -882,7 +907,8 @@ func (tf *transformer) transformDirectives(comments []*ast.CommentGroup) error {
 	for _, group := range comments {
 		for _, comment := range group.List {
 			switch {
-			case strings.HasPrefix(comment.Text, "//go:linkname "):
+			case strings.HasPrefix(comment.Text, "//go:linkname "),
+				strings.HasPrefix(comment.Text, "//go:linknamestd "):
 				// We can have either just one argument:
 				//
 				//	//go:linkname localName
@@ -892,6 +918,10 @@ func (tf *transformer) transformDirectives(comments []*ast.CommentGroup) error {
 				//
 				//	//go:linkname localName newName
 				//	//go:linkname localName pkg.newName
+				//
+				// Go 1.27's //go:linknamestd takes the same arguments;
+				// it only differs in relaxing the linker's checklinkname
+				// restriction for references to standard library symbols.
 				fields := strings.Fields(comment.Text)
 				localName := fields[1]
 				newName := ""
@@ -937,7 +967,7 @@ func (tf *transformer) transformDirectives(comments []*ast.CommentGroup) error {
 }
 
 func (tf *transformer) directiveLocalName(localName string) string {
-	if tf.curPkg.ToObfuscate && !compilerIntrinsics[tf.curPkg.ImportPath][localName] {
+	if tf.curPkg.ToObfuscate && !isToolchainNameDependency(tf.curPkg.ImportPath, localName) {
 		return hashWithPackage(tf.curPkg, localName)
 	}
 	return localName
@@ -964,7 +994,11 @@ func (tf *transformer) transformLinkname(localName, newName string) (string, str
 		return localName, newName
 	}
 
-	pkgSplit := 0
+	// The dot separating the package path from the name always comes after
+	// the last slash, as the name cannot contain slashes. Skip any earlier
+	// dots, which are part of the path itself, such as the domain name in
+	// "golang.org/x/net/internal/http3_test.protocolSetHTTP3".
+	pkgSplit := max(strings.LastIndex(newName, "/"), 0)
 	var foreignName string
 	var lpkg *listedPackage
 	for {
@@ -1004,7 +1038,7 @@ func (tf *transformer) transformLinkname(localName, newName string) (string, str
 		panic(err) // shouldn't happen
 	}
 
-	if !lpkg.ToObfuscate || compilerIntrinsics[lpkg.ImportPath][foreignName] {
+	if !lpkg.ToObfuscate || isToolchainNameDependency(lpkg.ImportPath, foreignName) {
 		// We're not obfuscating that package or name.
 		return localName, newName
 	}
@@ -1342,7 +1376,7 @@ func (tf *transformer) obfuscatedObjectName(obj types.Object) (string, bool) {
 	case *types.TypeName:
 		debugName = "type"
 	case *types.Func:
-		if compilerIntrinsics[path][name] {
+		if isToolchainNameDependency(path, name) {
 			return "", false
 		}
 
@@ -1525,6 +1559,15 @@ func (tf *transformer) transformLink(args []string) ([]string, error) {
 	// Ensure we strip the -buildid flag, to not leak any build IDs for the
 	// link operation or the main package's compilation.
 	flags = flagSetValue(flags, "-buildid", "")
+
+	// Clearing Go's build ID is not enough when linking externally,
+	// as the C toolchain adds one of its own, such as ELF's
+	// .note.gnu.build-id. -B=none asks cmd/link for no native build ID.
+	// macOS is the exception, as its dynamic linker refuses to load
+	// binaries which lack an LC_UUID load command.
+	if sharedCache.GoEnv.GOOS != "darwin" {
+		flags = append(flags, "-B=none")
+	}
 
 	// Strip debug information and symbol tables.
 	flags = append(flags, "-w", "-s")

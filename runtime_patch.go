@@ -6,6 +6,7 @@ package main
 import (
 	"go/ast"
 	"go/token"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -15,7 +16,7 @@ import (
 // updateMagicValue updates the global constant
 // `Go120PCLnTabMagic PCLnTabMagic = 0xfffffff1`
 // to use the provided magic value integer.
-// This is the latest magic value in use as of Go 1.26.
+// This is the latest magic value in use as of Go 1.27.
 func updateMagicValue(file *ast.File, magicValue uint32) {
 	magicUpdated := false
 
@@ -120,6 +121,66 @@ func updateEntryOffset(file *ast.File, entryOffKey uint32) {
 	}
 }
 
+func stripFatalStringFragments(expr ast.Expr) {
+	switch expr := expr.(type) {
+	case *ast.BasicLit:
+		if expr.Kind == token.STRING {
+			expr.Value = `""`
+		}
+	case *ast.ParenExpr:
+		stripFatalStringFragments(expr.X)
+	case *ast.BinaryExpr:
+		if expr.Op == token.ADD {
+			stripFatalStringFragments(expr.X)
+			stripFatalStringFragments(expr.Y)
+		}
+	}
+}
+
+// runtimeFatalCalls lists, per package, the diagnostic functions whose string
+// arguments are blanked in tiny mode. In the standard library these are
+// linknamed to [runtime.throw]/runtime.fatal (or, for exithook, populated with
+// [runtime.throw] at init), so garble's runtime-only cleanup would otherwise
+// leave their messages in the binary; cgroup also prints one such message
+// through the print builtins. The names are kept exact because in these
+// packages every such call is a crash diagnostic whose message is throwaway.
+var runtimeFatalCalls = map[string][]string{
+	"runtime":                   {"throw", "fatal"},
+	"crypto/internal/fips140":   {"fatal"},
+	"crypto/internal/sysrand":   {"fatal"},
+	"crypto/rand":               {"fatal"},
+	"internal/runtime/cgroup":   {"throw", "print", "println"},
+	"internal/runtime/exithook": {"Throw"},
+	"internal/runtime/maps":     {"fatal"},
+	"internal/sync":             {"throw", "fatal"},
+	"sync":                      {"throw", "fatal"},
+}
+
+// stripFatalMessages blanks the static string fragments passed to the diagnostic
+// functions named for importPath. Non-literal arguments keep being evaluated, so
+// their local uses and side effects are preserved; only the embedded text is
+// removed, and tiny mode already suppresses the runtime's fatal output.
+func stripFatalMessages(importPath string, file *ast.File) {
+	callNames := runtimeFatalCalls[importPath]
+	if callNames == nil {
+		return
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		id, ok := call.Fun.(*ast.Ident)
+		if !ok || !slices.Contains(callNames, id.Name) {
+			return true
+		}
+		for _, arg := range call.Args {
+			stripFatalStringFragments(arg)
+		}
+		return true
+	})
+}
+
 // stripRuntime removes unnecessary code from the runtime,
 // such as panic and fatal error printing, and code that
 // prints trace/debug info of the runtime.
@@ -206,12 +267,10 @@ func stripRuntime(basename string, file *ast.File) (strippedFunctions map[string
 				funcDecl.Body.List = nil
 			}
 		case "runtime1.go":
-			switch funcDecl.Name.Name {
-			case "setTraceback":
-				// tracebacks are completely hidden, no
-				// sense keeping this function
-				funcDecl.Body.List = nil
-			}
+			// setTraceback is deliberately left alone. Besides selecting how
+			// much of a traceback is printed, it decides whether fatal errors
+			// crash the process rather than exiting with status 2, and it
+			// enables Windows Error Reporting for GOTRACEBACK=wer.
 		case "runtime.go":
 			// writeErrStr bypasses the print builtins and writes fixed fatal
 			// diagnostics straight to stderr (and SetCrashOutput). Tiny mode
