@@ -136,6 +136,10 @@ func slicesOps() {
 	return
 }
 
+type namedMap map[string]int
+
+type namedString string
+
 func iterAndMapsOps() {
 	sprintf := makeSprintf("iterAndMapsOps")
 
@@ -163,7 +167,28 @@ func iterAndMapsOps() {
 		sprintf(idx, s)
 	}
 
+	for i, r := range "héllo" {
+		sprintf(i, r)
+	}
+
+	for i, r := range "\xff\x41" {
+		sprintf(i, r)
+	}
+
 	sprintf(mmap["April"].String())
+
+	nm := namedMap{"a": 1, "b": 2}
+	var nmkeys []string
+	for k := range nm {
+		nmkeys = append(nmkeys, k)
+	}
+	sort.Strings(nmkeys)
+	sprintf(nmkeys)
+
+	ns := namedString("hello")
+	for i, r := range ns {
+		sprintf(i, r)
+	}
 	return
 }
 
@@ -234,6 +259,12 @@ func methodOps() {
 	thunkMethod2 := (*structCalls).Return2
 	sprintf(thunkMethod2(&strct))
 
+	boundMethod := strct.Return1
+	sprintf(boundMethod())
+
+	boundMethod2 := strct.Return2
+	sprintf(boundMethod2())
+
 	closureVar := "c " + s
 	anonFnc := func(n func(structCalls) string) string {
 		return n(structCalls{}) + "anon" + closureVar
@@ -272,6 +303,22 @@ func chanOps() {
 	val, ok := <-a
 
 	sprintf(val, ok)
+
+	f := make(chan string, 1)
+	f <- "x"
+	select {
+	case r, ok := <-f:
+		sprintf("sel-ok", r, ok)
+	default:
+		sprintf("sel-default")
+	}
+	close(f)
+	select {
+	case r, ok := <-f:
+		sprintf("sel-closed", r, ok)
+	default:
+		sprintf("sel-default2")
+	}
 	return
 }
 
@@ -305,6 +352,13 @@ type testStruct struct {
 	A, B int
 }
 
+type blankFieldStruct struct {
+	_ int
+	X int
+}
+
+type aliasStruct = struct{ X int }
+
 func typeOps() {
 	sprintf := makeSprintf("typeOps")
 
@@ -331,6 +385,12 @@ func typeOps() {
 	strc.B += strc.A
 	sprintf(strc)
 
+	bs := blankFieldStruct{return42(), 7}
+	sprintf(bs.X)
+
+	as := aliasStruct{return42()}
+	sprintf(as.X)
+
 	// Access to unexported structure
 	discard := io.Discard
 	if return42() == 0 {
@@ -347,6 +407,14 @@ func sumIntsOrFloats[K comparable, V int64 | float64](m map[K]V) V {
     return s
 }
 
+type genericBox[T any] struct {
+	val T
+}
+
+func (b genericBox[T]) get() T {
+	return b.val
+}
+
 func genericFunc() {
 	sprintf := makeSprintf("genericFunc")
 	
@@ -361,6 +429,17 @@ func genericFunc() {
 		"second": 12.1,
     }
 	sprintf(sumIntsOrFloats(floats))
+
+	sprintf(genericConvert(int64(34)))
+	sprintf(genericConvert(float64(12.5)))
+
+	box := genericBox[int]{val: 42}
+	getVal := box.get
+	sprintf(getVal())
+}
+
+func genericConvert[T ~int64 | ~float64](x T) float64 {
+	return float64(x)
 }
 `
 

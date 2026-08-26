@@ -139,6 +139,7 @@ func isVoidType(typ types.Type) bool {
 }
 
 func isStringType(typ types.Type) bool {
+	typ = typ.Underlying()
 	return types.Identical(typ, types.Typ[types.String]) || types.Identical(typ, types.Typ[types.UntypedString])
 }
 
@@ -146,6 +147,7 @@ func getFieldName(tp types.Type, index int) (string, error) {
 	if pt, ok := tp.(*types.Pointer); ok {
 		tp = pt.Elem()
 	}
+	tp = types.Unalias(tp)
 	if named, ok := tp.(*types.Named); ok {
 		tp = named.Underlying()
 	}
@@ -564,6 +566,12 @@ func (fc *funcConverter) convertBlock(astFunc *AstFunc, ssaBlock *ssa.BasicBlock
 				return err
 			}
 			stmt = defineVar(instr, castExpr)
+		case *ssa.MultiConvert:
+			castExpr, err := fc.castCallExpr(instr.Type(), instr.X)
+			if err != nil {
+				return err
+			}
+			stmt = defineVar(instr, castExpr)
 		case *ssa.Defer:
 			callExpr, err := fc.convertCall(instr.Call)
 			if err != nil {
@@ -594,6 +602,19 @@ func (fc *funcConverter) convertBlock(astFunc *AstFunc, ssaBlock *ssa.BasicBlock
 			if err != nil {
 				return err
 			}
+
+			if fieldName == "_" {
+				// Blank fields cannot be referenced; the store to them is a
+				// no-op, but its value expression may still have side effects.
+				fieldType := instr.Type().Underlying().(*types.Pointer).Elem()
+				fieldTypeExpr, err := fc.tc.Convert(fieldType)
+				if err != nil {
+					return err
+				}
+				stmt = defineVar(instr, ah.CallExprByName("new", fieldTypeExpr))
+				break
+			}
+
 			stmt = defineVar(instr, &ast.UnaryExpr{
 				Op: token.AND,
 				X:  ah.SelectExpr(xExpr, ast.NewIdent(fieldName)),
@@ -732,12 +753,13 @@ func (fc *funcConverter) convertBlock(astFunc *AstFunc, ssaBlock *ssa.BasicBlock
 			}
 
 			if instr.IsString {
-				idxName := fc.tupleVarName(instr.Iter, 0)
+				runeIdxName := fc.tupleVarName(instr.Iter, 0)
 				iterValName := fc.tupleVarName(instr.Iter, 1)
+				offsetsName := fc.tupleVarName(instr.Iter, 2)
 
 				stmt = ah.BlockStmt(
 					ah.AssignStmt(ast.NewIdent(okName), &ast.BinaryExpr{
-						X:  ast.NewIdent(idxName),
+						X:  ast.NewIdent(runeIdxName),
 						Op: token.LSS,
 						Y:  ah.CallExprByName("len", ast.NewIdent(iterValName)),
 					}),
@@ -747,9 +769,9 @@ func (fc *funcConverter) convertBlock(astFunc *AstFunc, ssaBlock *ssa.BasicBlock
 							&ast.AssignStmt{
 								Lhs: []ast.Expr{ast.NewIdent(keyName), ast.NewIdent(valName)},
 								Tok: token.ASSIGN,
-								Rhs: []ast.Expr{ast.NewIdent(idxName), ah.IndexExprByExpr(ast.NewIdent(iterValName), ast.NewIdent(idxName))},
+								Rhs: []ast.Expr{ah.IndexExprByExpr(ast.NewIdent(offsetsName), ast.NewIdent(runeIdxName)), ah.IndexExprByExpr(ast.NewIdent(iterValName), ast.NewIdent(runeIdxName))},
 							},
-							&ast.IncDecStmt{X: ast.NewIdent(idxName), Tok: token.INC},
+							&ast.IncDecStmt{X: ast.NewIdent(runeIdxName), Tok: token.INC},
 						),
 					},
 				)
@@ -779,22 +801,32 @@ func (fc *funcConverter) convertBlock(astFunc *AstFunc, ssaBlock *ssa.BasicBlock
 				return err
 			}
 			if isStringType(instr.X.Type()) {
-				idxName := fc.tupleVarName(instr, 0)
-				valName := fc.tupleVarName(instr, 1)
+				runeIdxName := fc.tupleVarName(instr, 0)
+				iterValName := fc.tupleVarName(instr, 1)
+				offsetsName := fc.tupleVarName(instr, 2)
 
-				astFunc.Vars[idxName] = types.Typ[types.Int]
-				astFunc.Vars[valName] = types.NewSlice(types.Typ[types.Rune])
+				astFunc.Vars[runeIdxName] = types.Typ[types.Int]
+				astFunc.Vars[iterValName] = types.NewSlice(types.Typ[types.Rune])
+				astFunc.Vars[offsetsName] = types.NewSlice(types.Typ[types.Int])
 
-				stmt = &ast.AssignStmt{
-					Lhs: []ast.Expr{ast.NewIdent(idxName), ast.NewIdent(valName)},
-					Tok: token.ASSIGN,
-					Rhs: []ast.Expr{
-						ah.IntLit(0),
-						ah.CallExpr(&ast.ArrayType{Elt: ast.NewIdent("rune")}, xExpr),
+				idxName := fc.tupleVarName(instr, 3)
+				runeName := fc.tupleVarName(instr, 4)
+
+				stmt = ah.BlockStmt(
+					&ast.RangeStmt{
+						Key:   ast.NewIdent(idxName),
+						Value: ast.NewIdent(runeName),
+						Tok:   token.DEFINE,
+						X:     xExpr,
+						Body: ah.BlockStmt(
+							ah.AssignStmt(ast.NewIdent(iterValName), ah.CallExprByName("append", ast.NewIdent(iterValName), ast.NewIdent(runeName))),
+							ah.AssignStmt(ast.NewIdent(offsetsName), ah.CallExprByName("append", ast.NewIdent(offsetsName), ast.NewIdent(idxName))),
+						),
 					},
-				}
+					ah.AssignStmt(ast.NewIdent(runeIdxName), ah.IntLit(0)),
+				)
 			} else {
-				makeIterExpr, nextType, err := makeMapIteratorPolyfill(fc.tc, instr.X.Type().(*types.Map))
+				makeIterExpr, nextType, err := makeMapIteratorPolyfill(fc.tc, instr.X.Type().Underlying().(*types.Map))
 				if err != nil {
 					return err
 				}
@@ -835,7 +867,16 @@ func (fc *funcConverter) convertBlock(astFunc *AstFunc, ssaBlock *ssa.BasicBlock
 					if valHasRefs {
 						astFunc.Vars[valName] = valType
 					}
-					commStmt = ah.AssignStmt(ast.NewIdent(valName), &ast.UnaryExpr{Op: token.ARROW, X: chanExpr})
+					recvExpr := &ast.UnaryExpr{Op: token.ARROW, X: chanExpr}
+					if okHasRefs {
+						commStmt = &ast.AssignStmt{
+							Lhs: []ast.Expr{ast.NewIdent(valName), ast.NewIdent(okName)},
+							Tok: token.ASSIGN,
+							Rhs: []ast.Expr{recvExpr},
+						}
+					} else {
+						commStmt = ah.AssignStmt(ast.NewIdent(valName), recvExpr)
+					}
 					recvIndex++
 				default:
 					return fmt.Errorf("not supported select chan dir %d: %w", state.Dir, ErrUnsupported)
@@ -975,6 +1016,17 @@ func (fc *funcConverter) convertBlock(astFunc *AstFunc, ssaBlock *ssa.BasicBlock
 			}
 		case *ssa.MakeClosure:
 			anonFunc := instr.Fn.(*ssa.Function)
+			if strings.HasSuffix(anonFunc.Name(), "$bound") {
+				recvExpr, err := fc.convertSsaValue(instr.Bindings[0])
+				if err != nil {
+					return err
+				}
+				methodName := strings.TrimSuffix(anonFunc.Name(), "$bound")
+				methodName, _, _ = strings.Cut(methodName, "[")
+				stmt = defineVar(instr, ah.SelectExpr(recvExpr, ast.NewIdent(methodName)))
+				break
+			}
+
 			anonFuncName, err := fc.getAnonFunctionName(anonFunc)
 			if err != nil {
 				return err
