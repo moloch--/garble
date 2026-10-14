@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -125,6 +126,9 @@ func TestScript(t *testing.T) {
 		// TODO: this condition should probably be supported by gotooltest
 		Condition: func(cond string) (bool, error) {
 			switch cond {
+			case "qemu-riscv64":
+				_, err := exec.LookPath("qemu-riscv64")
+				return err == nil, nil
 			case "cgo":
 				out, err := exec.Command("go", "env", "CGO_ENABLED").Output()
 				if err != nil {
@@ -393,6 +397,23 @@ func setupGo(ts *testscript.TestScript, neg bool, args []string) {
 	ts.Setenv("GOROOT", "")
 }
 
+func TestSplitFlagsFromFiles(t *testing.T) {
+	t.Parallel()
+	backing, err := filepath.Abs("backing.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ext := range []string{".go", ".s"} {
+		for _, path := range []string{"./backing.txt", backing} {
+			flags := []string{"-p", "package.go", "-trimpath", backing + "=>original" + ext + ";unused=>", "-pack"}
+			args := append(slices.Clone(flags), "normal"+ext, path)
+			gotFlags, gotPaths := splitFlagsFromFiles(args, ext)
+			qt.Assert(t, qt.DeepEquals(gotFlags, flags))
+			qt.Assert(t, qt.DeepEquals(gotPaths, []string{"normal" + ext, path}))
+		}
+	}
+}
+
 func TestSplitFlagsFromArgs(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -422,6 +443,36 @@ func TestSplitFlagsFromArgs(t *testing.T) {
 			[2][]string{{"-race"}, {"pkg"}},
 		},
 		{
+			"PrefixedBoolFlagsAndArgs",
+			[]string{"-test.v", "pkg"},
+			[2][]string{{"-test.v"}, {"pkg"}},
+		},
+		{
+			"SeparatorAfterFlag",
+			[]string{"-trimpath", "--", "pkg"},
+			[2][]string{{"-trimpath", "--"}, {"pkg"}},
+		},
+		{
+			"SeparatorFirst",
+			[]string{"--", "pkg"},
+			[2][]string{{"--"}, {"pkg"}},
+		},
+		{
+			"LongBoolFlagsAndArgs",
+			[]string{"--trimpath", "pkg"},
+			[2][]string{{"--trimpath"}, {"pkg"}},
+		},
+		{
+			"LongExplicitBoolFlag",
+			[]string{"--race=false", "pkg"},
+			[2][]string{{"--race=false"}, {"pkg"}},
+		},
+		{
+			"LongValueFlag",
+			[]string{"--tags", "tag", "pkg"},
+			[2][]string{{"--tags", "tag"}, {"pkg"}},
+		},
+		{
 			"ExplicitBoolFlag",
 			[]string{"-race=true", "pkg"},
 			[2][]string{{"-race=true"}, {"pkg"}},
@@ -435,6 +486,19 @@ func TestSplitFlagsFromArgs(t *testing.T) {
 
 			qt.Assert(t, qt.DeepEquals(got, test.want))
 		})
+	}
+}
+
+func TestTestBooleanFlags(t *testing.T) {
+	for _, name := range []string{"artifacts", "benchmem", "failfast", "fullpath", "short", "v"} {
+		for _, prefix := range []string{"-", "-test.", "--test."} {
+			arg := prefix + name
+			flags, args := splitFlagsFromArgs([]string{arg, "pkg"})
+			qt.Assert(t, qt.DeepEquals(flags, []string{arg}))
+			qt.Assert(t, qt.DeepEquals(args, []string{"pkg"}))
+			forwarded, _ := filterForwardBuildFlags([]string{arg, "-tags", "tag"})
+			qt.Assert(t, qt.DeepEquals(forwarded, []string{"-tags", "tag"}))
+		}
 	}
 }
 
@@ -460,6 +524,16 @@ func TestFilterForwardBuildFlags(t *testing.T) {
 			"NonBinarySkipped",
 			[]string{"-o", "binary", "-tags", "foo"},
 			[]string{"-tags", "foo"},
+		},
+		{
+			"UnknownTestBooleanThenBuildFlag",
+			[]string{"-custom", "-tags=special", "-count=1"},
+			[]string{"-tags=special"},
+		},
+		{
+			"UnknownTestValueThenBuildFlag",
+			[]string{"-custom", "value", "-tags", "special"},
+			[]string{"-tags", "special"},
 		},
 	}
 	for _, test := range tests {
@@ -493,5 +567,105 @@ func TestFlagValue(t *testing.T) {
 			got := flagValue(test.flags, test.flagName)
 			qt.Assert(t, qt.DeepEquals(got, test.want))
 		})
+	}
+}
+
+func TestRuntimeFuncIDBuiltinSymbols(t *testing.T) {
+	for _, name := range []string{
+		"abort", "asmcgocall", "asyncPreempt", "cgocallback", "corostart",
+		"debugCallV2", "deferreturn", "gcBgMarkWorker", "goexit", "gogo",
+		"gopanic", "handleAsyncEvent", "main", "mcall", "morestack", "mstart",
+		"panicwrap", "rt0_go", "runCleanups", "runFinalizers", "sigpanic",
+		"systemstack", "systemstack_switch",
+	} {
+		if !slices.Contains(builtinSymbols["runtime"], name) {
+			t.Errorf("runtime.%s must be included in the assembler symbol map", name)
+		}
+	}
+}
+
+func TestRuntimeGoexitToolchainDependency(t *testing.T) {
+	if !isToolchainNameDependency("runtime", "goexit") {
+		t.Fatal("runtime.goexit must keep its assembly name for runtime stack metadata")
+	}
+	if !slices.Contains(builtinSymbols["runtime"], "goexit") {
+		t.Fatal("runtime.goexit must be included in the linker symbol map")
+	}
+}
+
+func TestRuntimeAddmoduledataBuiltinSymbol(t *testing.T) {
+	if !slices.Contains(builtinSymbols["runtime"], "addmoduledata") {
+		t.Fatal("runtime.addmoduledata must be included in the linker symbol map")
+	}
+}
+
+func TestRuntimeModuledataBuiltinSymbol(t *testing.T) {
+	for _, name := range []string{"moduledata", "modulehash"} {
+		if !slices.Contains(builtinSymbols["runtime"], name) {
+			t.Errorf("runtime.%s must be included in the linker symbol map", name)
+		}
+	}
+}
+
+func TestRuntimeAsmcgocallLandingpadBuiltinSymbol(t *testing.T) {
+	if !slices.Contains(builtinSymbols["runtime"], "asmcgocall_landingpad") {
+		t.Fatal("runtime.asmcgocall_landingpad must be included in the assembler symbol map")
+	}
+}
+
+func TestRuntimeBuiltinSymbolsExcludeNonSymbolLiterals(t *testing.T) {
+	for _, name := range []string{"elf_", "go", "retpoline", "test"} {
+		if slices.Contains(builtinSymbols["runtime"], name) {
+			t.Errorf("runtime.%s is not a complete symbol name", name)
+		}
+	}
+}
+
+func TestFuzzCoverageBoundarySymbols(t *testing.T) {
+	for _, name := range []string{"_counters", "_ecounters"} {
+		if !slices.Contains(builtinSymbols["internal/fuzz"], name) {
+			t.Errorf("internal/fuzz.%s must be included in the linker symbol map", name)
+		}
+	}
+}
+
+func TestRuntimeGeneratedLinkerSymbols(t *testing.T) {
+	for _, name := range []string{"buildVersion", "modinfo", "unreachableMethod"} {
+		if !slices.Contains(builtinSymbols["runtime"], name) {
+			t.Errorf("runtime.%s must be included in the linker symbol map", name)
+		}
+	}
+}
+
+func TestStructsHostLayoutToolchainDependency(t *testing.T) {
+	if !isToolchainNameDependency("structs", "HostLayout") {
+		t.Fatal("structs.HostLayout must keep its name for go:wasmimport validation")
+	}
+}
+
+func TestReplaceGoAsmNamesPreservesOtherIdentifiers(t *testing.T) {
+	nameMap := map[string]string{
+		"asm__size": "obfuscated__size",
+		"wasm_pc":   "obfuscated_pc",
+	}
+	input := "#include \"garbled_asm_ppc64x.h\"\nMOVD $asm__size, R3\nCall wasm_pc_f_loop(SB)\nMOVD $wasm_pc, R4\n"
+	want := "#include \"garbled_asm_ppc64x.h\"\nMOVD $obfuscated__size, R3\nCall wasm_pc_f_loop(SB)\nMOVD $obfuscated_pc, R4\n"
+	if got := replaceGoAsmNames(input, nameMap); got != want {
+		t.Fatalf("replaceGoAsmNames() = %q, want %q", got, want)
+	}
+}
+
+func TestReverseContentPreservesRuntimeFrames(t *testing.T) {
+	const input = "runtime.main()\n	runtime/proc.go:1 +0x1\nruntime.goexit()\n	runtime/asm_amd64.s:1 +0x1\n"
+	var out strings.Builder
+	modified, err := reverseContent(&out, strings.NewReader(input), strings.NewReplacer(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modified {
+		t.Fatal("reverseContent reported a modification without a matching replacement")
+	}
+	if got := out.String(); got != input {
+		t.Fatalf("reverseContent removed runtime frames:\n%s", got)
 	}
 }

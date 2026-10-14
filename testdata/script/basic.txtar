@@ -1,4 +1,4 @@
-# Check that the simplest use of garble works. Note the lack of a module or GOGARBLE.
+# Check that the simplest use of garble works with a module.
 exec garble build -o=main$exe garble_main.go
 exec ./main
 cmp stderr main.stderr
@@ -24,6 +24,64 @@ stdout 'unknown'
 
 # The binary can't contain the version string either.
 ! binsubstr main$exe ${WORK} 'garble_main.go' 'globalVar' 'globalFunc' 'garble' $gofullversion
+
+# Both the main package and an imported package are obfuscated by default.
+exec garble build -o=app_binary$exe --trimpath -- ./importer
+! binsubstr app_binary$exe 'test/mainfoo/dep' 'test/mainfoo/importer' 'dep.Message'
+exec ./app_binary$exe
+stderr 'unique sentinel from imported package for obfuscation'
+stderr 'unique sentinel from main package for obfuscation'
+
+# An overlay backing file need not have a .go extension.
+cp dep/dep.go dep/dep.txt
+exec garble build -overlay overlay.json -o=overlay_binary$exe ./importer
+exec ./overlay_binary$exe
+stderr 'overlaid sentinel from main package for obfuscation'
+stderr 'unique sentinel from imported package for obfuscation'
+! binsubstr overlay_binary$exe 'dep.Message'
+
+# Explicit * and an empty value behave like an unset GOGARBLE.
+env GOGARBLE=*
+exec garble build -o=app_binary$exe ./importer
+env GOGARBLE=
+exec garble build -o=app_binary$exe ./importer
+exec ./app_binary$exe
+stderr 'unique sentinel from imported package for obfuscation'
+stderr 'unique sentinel from main package for obfuscation'
+# Partial selections fail with an explanation of the new behavior.
+env GOGARBLE=test/mainfoo/dep
+! exec garble build -o=app_binary$exe ./importer
+stderr 'GOGARBLE=.*is no longer supported; all packages including the runtime are obfuscated now'
+env GOGARBLE=*
+
+# Instrumented builds preserve the compiler's coverage variables and hook.
+exec garble build -cover -o=covered$exe garble_main.go
+mkdir coverdir
+env GOCOVERDIR=$WORK/coverdir
+exec ./covered$exe
+cmp stderr main.stderr
+exec go tool covdata percent -i=$WORK/coverdir
+stdout 'coverage: 100.0% of statements'
+env GOCOVERDIR=
+
+# A leading -C changes directory before module discovery and relative outputs.
+cd ..
+exec garble build -C $WORK -o=chdir_binary$exe garble_main.go
+exec $WORK/chdir_binary$exe
+cmp stderr $WORK/main.stderr
+exec garble run -C $WORK garble_main.go
+cmp stderr $WORK/main.stderr
+cd $WORK
+exec garble build --C=. -o=chdir_binary$exe garble_main.go
+exec $WORK/chdir_binary$exe
+cmp stderr $WORK/main.stderr
+! exec garble build -v -C basic garble_main.go
+stderr '-C flag must be first flag on command line'
+! exec garble build -C
+stderr 'flag needs an argument: -C'
+! exec garble build -C nonexistent-directory garble_main.go
+stderr 'chdir nonexistent-directory'
+cd $WORK
 
 [short] stop # checking that the build is reproducible is slow
 
@@ -70,6 +128,30 @@ func globalFunc() { println("global func body") }
 func main() {
 	println(globalVar)
 	globalFunc()
+}
+-- importer/main.go --
+package main
+
+import "test/mainfoo/dep"
+
+func main() {
+	println(dep.Message())
+	println("unique sentinel from main package for obfuscation")
+}
+-- dep/dep.go --
+package dep
+
+func Message() string { return "unique sentinel from imported package for obfuscation" }
+-- overlay.json --
+{"Replace":{"importer/main.go":"importer/main.txt","dep/dep.go":"dep/dep.txt"}}
+-- importer/main.txt --
+package main
+
+import "test/mainfoo/dep"
+
+func main() {
+	println(dep.Message())
+	println("overlaid sentinel from main package for obfuscation")
 }
 -- main.stderr --
 global value

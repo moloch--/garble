@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,7 +19,6 @@ import (
 	"time"
 
 	"github.com/tinylib/msgp/msgp"
-	"golang.org/x/mod/module"
 )
 
 //go:generate go run scripts/gen_go_std_tables.go
@@ -53,8 +53,6 @@ type sharedCacheType struct {
 	// The only unique way to identify garble's version without being published
 	// or committed is to use its content ID from the build cache.
 	BinaryContentID []byte
-
-	GOGARBLE string
 
 	// GoCmd is [GoEnv.GOROOT]/bin/go, so that we run exactly the same version
 	// of the Go tool that the original "go build" invocation did.
@@ -288,13 +286,23 @@ type listedPackage struct {
 
 	// GarbleActionID is a hash combining the Action ID from BuildID,
 	// with Garble's own inputs as per addGarbleToHash.
-	// It is set even when ToObfuscate is false, as it is also used for random
+	// It is set even when toObfuscate is false, as it is also used for random
 	// seeds and build cache paths, and not just to obfuscate names.
 	GarbleActionID [sha256.Size]byte `json:"-"`
+}
 
-	// ToObfuscate records whether the package should be obfuscated.
-	// When true, GarbleActionID must not be empty.
-	ToObfuscate bool `json:"-"`
+// toObfuscate excludes runtime/cgo (which crashes on Windows), FIPS packages
+// (whose special symbols and no-relocation rule prevent obfuscation), and empty
+// packages such as OS-specific packages with no matching files.
+func (p *listedPackage) toObfuscate() bool {
+	path := p.ImportPath
+	if p.ForTest != "" {
+		path = p.ForTest
+	}
+	return path != "runtime/cgo" &&
+		path != "crypto/internal/fips140" &&
+		!strings.HasPrefix(path, "crypto/internal/fips140/") &&
+		len(p.CompiledGoFiles) > 0
 }
 
 func (p *listedPackage) hasDep(path string) bool {
@@ -333,8 +341,16 @@ type packageError struct {
 // obfuscatedPackageName returns a package's obfuscated package name,
 // which may be unchanged in some cases where we cannot obfuscate it.
 // Note that package main is unchanged as it is treated in a special way by the toolchain.
+// The package name must stay in sync with the import path - if the import path is not
+// obfuscated (e.g., for compiler intrinsics), the name must also be preserved.
 func (p *listedPackage) obfuscatedPackageName() string {
-	if p.Name == "main" || !p.ToObfuscate {
+	if p.Name == "main" || !p.toObfuscate() {
+		return p.Name
+	}
+	// If the import path is not obfuscated, the package name shouldn't be either.
+	// This happens for packages like runtime, reflect, embed, and packages with
+	// compiler intrinsics.
+	if p.obfuscatedImportPath() == p.ImportPath {
 		return p.Name
 	}
 	// The package name itself is obfuscated like any other name.
@@ -356,43 +372,104 @@ func (p *listedPackage) obfuscatedImportPath() string {
 	if p.Name == "main" && p.ForTest == "" {
 		return "main"
 	}
-	if !p.ToObfuscate {
+	if !p.toObfuscate() {
 		return p.ImportPath
 	}
-	// We can't obfuscate these standard library import paths,
-	// as the toolchain expects to recognize the packages by them:
-	//
-	//   * runtime: it is special in many ways
-	//   * reflect: its presence turns down dead code elimination
-	//   * embed: its presence enables using //go:embed
-	//   * others like syscall are allowed by import path to have more ABI tricks
+	// Keep import paths whose toolchain contracts are not yet translated.
+	// Runtime package paths and intrinsic paths are translated by the patched
+	// compiler and linker through GARBLE_PKGPATH_MAP and GARBLE_SYMBOL_MAP.
 	switch p.ImportPath {
-	case "runtime", "reflect", "embed",
-		// TODO: collect directly from cmd/internal/objabi/pkgspecial.go,
-		// in this particular case from allowAsmABIPkgs.
+	case "reflect", "embed",
+		// WASI host imports recognize structs.HostLayout by exact package path.
+		"structs",
+		// These packages are permitted to use special assembly ABIs by path.
+		"syscall",
+		"internal/bytealg",
+		"internal/chacha8rand",
+		"internal/abi",
 		"internal/runtime/syscall/linux",
 		"internal/runtime/syscall/windows",
-		"internal/runtime/startlinetest":
-		return p.ImportPath
-	}
-	// Intrinsics are matched by package import path as well.
-	if _, ok := compilerIntrinsics[p.ImportPath]; ok {
-		return p.ImportPath
-	}
-	// The linker forbids linknaming to certain runtime declarations
-	// unless a package is known to be allowed by import path string.
-	// The alternative would be to use -checklinkname=false, but that disables all checks entirely.
-	//
-	// TODO: we could probably remove this once we obfuscate the runtime,
-	// because then these runtime package and declaration names will be obfuscated too,
-	// so the linker will stop recognising them for the extra checks.
-	if _, ok := runtimeAndLinknamed[p.ImportPath]; ok {
+		"internal/runtime/startlinetest",
+		// The compiler identifies NotInHeap through this exact package path.
+		"internal/runtime/sys":
 		return p.ImportPath
 	}
 
 	newPath := hashWithPackage(p, p.ImportPath)
 	log.Printf("import path %q hashed with %x to %q", p.ImportPath, p.GarbleActionID, newPath)
 	return newPath
+}
+
+var runtimePkgPathSet = func() map[string]struct{} {
+	set := make(map[string]struct{}, len(runtimePkgPaths))
+	for _, pkgPath := range runtimePkgPaths {
+		set[pkgPath] = struct{}{}
+	}
+	return set
+}()
+
+func isRuntimePkgPath(path string) bool {
+	_, ok := runtimePkgPathSet[path]
+	return ok
+}
+
+// buildRuntimePkgPathMap builds a mapping of obfuscated->original paths for all
+// runtime packages. This is passed to the patched compiler so it can recognize
+// obfuscated runtime packages for special handling (write barriers, etc.)
+// Format: "obfuscated1=original1,obfuscated2=original2,..."
+func buildRuntimePkgPathMap() string {
+	var mappings []string
+	for _, pkgPath := range runtimePkgPaths {
+		lpkg, _ := sharedCache.ListedPackages.get(pkgPath)
+		if lpkg == nil {
+			continue // Package not in current build
+		}
+		obfuscatedPath := lpkg.obfuscatedImportPath()
+		if obfuscatedPath != pkgPath {
+			mappings = append(mappings, obfuscatedPath+"="+pkgPath)
+		}
+	}
+	slices.Sort(mappings)
+	return strings.Join(mappings, ",")
+}
+
+// buildSymbolMap builds a complete mapping of obfuscated->original symbols
+// for all intrinsic and builtin functions. This is passed to the patched
+// compiler and linker so they can recognize obfuscated symbols.
+// Format: "obfuscatedPkg.obfuscatedFunc=originalPkg.originalFunc,..."
+func buildSymbolMap() string {
+	var mappings []string
+	pkgPaths := slices.Sorted(maps.Keys(compilerIntrinsics))
+	for _, pkgPath := range pkgPaths {
+		lpkg, _ := sharedCache.ListedPackages.get(pkgPath)
+		if lpkg == nil || !lpkg.toObfuscate() {
+			continue
+		}
+		obfuscatedPath := lpkg.obfuscatedImportPath()
+		symbols := slices.Sorted(maps.Keys(compilerIntrinsics[pkgPath]))
+		for _, symbol := range symbols {
+			if obfuscatedPath != pkgPath {
+				mappings = append(mappings, obfuscatedPath+"."+symbol+"="+pkgPath+"."+symbol)
+			}
+		}
+	}
+
+	pkgPaths = slices.Sorted(maps.Keys(builtinSymbols))
+	for _, pkgPath := range pkgPaths {
+		lpkg, _ := sharedCache.ListedPackages.get(pkgPath)
+		if lpkg == nil || !lpkg.toObfuscate() {
+			continue
+		}
+		obfuscatedPath := lpkg.obfuscatedImportPath()
+		for _, symbol := range builtinSymbols[pkgPath] {
+			obfuscatedSymbol := obfuscatedPackageObjectName(lpkg, symbol)
+			if obfuscatedPath != pkgPath || obfuscatedSymbol != symbol {
+				mappings = append(mappings, obfuscatedPath+"."+obfuscatedSymbol+"="+pkgPath+"."+symbol)
+			}
+		}
+	}
+	slices.Sort(mappings)
+	return strings.Join(mappings, ",")
 }
 
 // garbleBuildFlags are always passed to top-level build commands such as
@@ -403,18 +480,18 @@ var garbleBuildFlags = []string{"-trimpath", "-buildvcs=false"}
 // current GOOS, sorted for determinism. They are reached via runtime linkname
 // rather than imports, so they don't show up in the dependency graph.
 func linknamedToList() []string {
-	linknamed := make([]string, 0, len(runtimeAndLinknamed))
-	for path := range runtimeAndLinknamed {
+	linknamed := slices.Sorted(maps.Keys(runtimeAndLinknamed))
+	linknamed = slices.DeleteFunc(linknamed, func(path string) bool {
 		switch {
 		case sharedCache.GoEnv.GOOS != "js" && path == "syscall/js":
 			// GOOS-specific package.
+			return true
 		case sharedCache.GoEnv.GOOS != "darwin" && sharedCache.GoEnv.GOOS != "ios" && path == "crypto/x509/internal/macos":
 			// GOOS-specific package.
-		default:
-			linknamed = append(linknamed, path)
+			return true
 		}
-	}
-	slices.Sort(linknamed)
+		return false
+	})
 	return linknamed
 }
 
@@ -427,13 +504,10 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 		// Similar flags to what go/packages uses.
 		"-json", "-export", "-compiled", "-e",
 	}
-	if mainBuild {
-		// When loading the top-level packages we are building,
-		// we want to transitively load all their dependencies as well.
-		// That is not the case when loading standard library packages,
-		// as runtimeAndLinknamed already contains transitive dependencies.
-		args = append(args, "-deps")
-	}
+	// Both the build targets and the extra linknamed packages need their
+	// transitive dependencies. The latter can reach standard packages absent
+	// from the build graph, which compile subprocesses cannot list themselves.
+	args = append(args, "-deps")
 	args = append(args, garbleBuildFlags...)
 	args = append(args, sharedCache.ForwardBuildFlags...)
 
@@ -448,27 +522,10 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 		})
 	}
 
-	// `go list` cannot mix .go file arguments with package paths, so the rare
-	// file-argument build lists the linknamed packages separately, below.
-	fileMode := mainBuild && len(packages) > 0 && strings.HasSuffix(packages[0], ".go")
-	if mainBuild && !fileMode {
-		if len(packages) == 0 {
-			// With no arguments the build targets the current directory; make
-			// that explicit so the appended packages don't displace it.
-			packages = []string{"."}
-		}
-		// Fold in the linknamed packages so each compile subprocess finds them
-		// in the shared cache instead of spawning its own `go list`. `go list`
-		// dedups them against the deps and `-mod` flags are harmless for std.
-		//
-		// They need -export like any other package, even though we never read
-		// their export data; it is the only way `go list` gives us a build ID
-		// to derive [listedPackage.GarbleActionID] from. Salting them by import
-		// path instead would make a package's hashed names depend on which
-		// packages the build includes, which Go's build cache does not key on,
-		// so two builds would disagree on a linkname's target and fail to link.
-		packages = append(packages, linknamedToList()...)
-	}
+	// List the build targets alone. Mixing extra standard packages into this
+	// invocation makes go list report PGO dependencies as "path [main]" variants,
+	// even though TOOLEXEC_IMPORTPATH uses the unadorned path. The variants can
+	// also shadow the build IDs of the actual packages being compiled.
 
 	args = append(args, packages...)
 	cmd := exec.Command(sharedCache.GoCmd, args...)
@@ -491,7 +548,6 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 
 	dec := json.NewDecoder(stdout)
 	var pkgErrors strings.Builder
-	anyToObfuscate := false
 	for dec.More() {
 		var pkg listedPackage
 		if err := dec.Decode(&pkg); err != nil {
@@ -499,7 +555,7 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 		}
 
 		if perr := pkg.Error; perr != nil {
-			// Folded-in linknamed packages may fail benignly, like sync_test
+			// Separately listed linknamed packages may fail benignly, like sync_test
 			// being "not in std"; ignore those, but still report errors for the
 			// user's own packages.
 			lenient := !mainBuild || runtimeAndLinknamed[pkg.ImportPath]
@@ -530,42 +586,14 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 		// "build constraints exclude all Go files" and can be ignored.
 		// Real build errors will still be surfaced by `go build -toolexec` later.
 		if sharedCache.ListedPackages.has(pkg.ImportPath) {
+			if !mainBuild {
+				// Keep the original build variant and its build ID.
+				continue
+			}
 			return fmt.Errorf("duplicate package: %q", pkg.ImportPath)
 		}
 		// Note that GarbleActionID is filled by toolexecCmd once the listing
 		// is done, as hashing it needs garble's own content ID.
-
-		// Decide ToObfuscate as we read each package, to avoid a second pass
-		// that would force a full decode of the lazy map in sub-processes.
-		// If "GOGARBLE=foo/bar", "foo/bar_test" should also match.
-		path := pkg.ImportPath
-		if pkg.ForTest != "" {
-			path = pkg.ForTest
-		}
-		switch {
-		// We do not support obfuscating the runtime nor its dependencies.
-		case runtimeAndDeps[path],
-			// "unknown pc" crashes on windows in the cgo test otherwise.
-			path == "runtime/cgo",
-			// Obfuscating any of the fips140 packages breaks builds,
-			// not just because their import paths get special treatment,
-			// but also because they have special vars like "RODATA"
-			// and forbid relocations caused by literal obfuscation.
-			path == "crypto/internal/fips140", strings.HasPrefix(path, "crypto/internal/fips140/"):
-
-		// No point in obfuscating empty packages, like OS-specific ones that don't match.
-		case len(pkg.CompiledGoFiles) == 0:
-
-		// Test main packages like "foo/bar.test" are always obfuscated,
-		// just like unnamed and plugin main packages.
-		case pkg.Name == "main" && strings.HasSuffix(path, ".test"),
-			path == "command-line-arguments",
-			strings.HasPrefix(path, "plugin/unnamed"),
-			module.MatchPrefixPatterns(sharedCache.GOGARBLE, path):
-
-			pkg.ToObfuscate = true
-			anyToObfuscate = true
-		}
 
 		sharedCache.ListedPackages.set(pkg.ImportPath, &pkg)
 	}
@@ -577,16 +605,10 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 		return errors.New(pkgErrors.String())
 	}
 
-	// Only the top-level build must match packages to obfuscate; the later
-	// runtime-linknamed std fill need not.
-	// Don't error if the user ran: GOGARBLE='*' garble build runtime
-	if mainBuild && !anyToObfuscate && !module.MatchPrefixPatterns(sharedCache.GOGARBLE, "runtime") {
-		return fmt.Errorf("GOGARBLE=%q does not match any packages to be built", sharedCache.GOGARBLE)
-	}
-
-	if fileMode {
-		// The fold above couldn't run, so list the still-missing linknamed
-		// packages here in the parent for the compile subprocesses to reuse.
+	if mainBuild {
+		// List only the linknamed packages absent from the build graph, once in
+		// the parent. Keep their -export BuildIDs for stable GarbleActionIDs;
+		// listing them alongside the build targets changes PGO package identity.
 		missing := slices.DeleteFunc(linknamedToList(), sharedCache.ListedPackages.has)
 		if len(missing) > 0 {
 			if err := appendListedPackages(missing, false); err != nil {
@@ -637,7 +659,7 @@ func listPackage(from *listedPackage, path string) (*listedPackage, error) {
 	// such as sync/atomic or reflect, without importing them in any way.
 	// A few other cases don't involve runtime, like time/tzdata linknaming to time,
 	// but luckily those few cases are covered by runtimeAndLinknamed as well,
-	// which appendListedPackages folds into the top-level `go list`.
+	// which appendListedPackages lists separately in the parent process.
 	if from.Standard {
 		if ok {
 			return pkg, nil
@@ -667,7 +689,6 @@ func listPackage(from *listedPackage, path string) (*listedPackage, error) {
 	// As a special case, any package can list an implicit linker dependency
 	// or one of its dependencies.
 	// We need to handle this ourselves as they do not appear in Imports.
-	// TODO: it might be faster to bring back a "runtimeAndDeps" map or func.
 	for _, implicit := range implicitLinkerDeps {
 		if pkg.ImportPath == implicit {
 			return pkg, nil

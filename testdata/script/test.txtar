@@ -26,7 +26,7 @@ stdout 'package bar_test, func name:'
 #
 # The combination of those used to result in "refusing to list non-dependency
 # package" errors, which we've currently worked around.
-exec garble test -v ./...
+exec garble test ./... -test.v -tags testprefix
 stdout 'ok\s+test/bar\s'
 stdout 'PASS.*TestFoo'
 stdout 'PASS.*TestMain'
@@ -41,9 +41,18 @@ stdout 'ok\s+test/bar/somemaintest\s'
 stdout 'ok\s+test/bar/sometest\s'
 stdout 'ok\s+test/bar/exporttest\s'
 
-# verify that non-build flags are kept
-exec garble test -withflag -v
+# verify that an unknown test flag does not consume a following build flag
+exec garble test . -withflag -tags testprefix -v
 stdout 'PASS.*TestWithFlag'
+stdout 'PASS.*TestTaggedFlag'
+
+# fuzzing must retain edge coverage guidance under obfuscation
+exec garble -seed=AAAAAAAAAAA test -fuzz=FuzzGuided -fuzztime=1x -run='^$' .
+stdout 'gathering baseline coverage:'
+! stdout 'not built with coverage instrumentation'
+
+go test -fuzz=FuzzGuided -fuzztime=1x -run='^$' .
+stdout 'gathering baseline coverage:'
 
 # verify with regular cmd/go; OriginalFuncName should appear
 go test -v
@@ -76,9 +85,21 @@ func OriginalFuncName() string {
 -- bar_test.go --
 package bar
 
-import "testing"
+import (
+	"encoding/xml"
+	"testing"
+)
+
+type Book struct {
+	XMLName struct{} `xml:"book"`
+	Title   string   `xml:",chardata"`
+}
 
 func TestFoo(t *testing.T) {
+	data, err := xml.Marshal(&Book{Title: "My book"})
+	if err != nil || string(data) != "<book>My book</book>" {
+		t.Fatalf("XML reflection: %s, %v", data, err)
+	}
 	t.Log(ImportedVar)
 	if LocalFoo() != "Foo" {
 		t.FailNow()
@@ -86,6 +107,23 @@ func TestFoo(t *testing.T) {
 	t.Logf("package bar, func name: %s", OriginalFuncName())
 }
 
+func FuzzGuided(f *testing.F) {
+	f.Add("seed")
+	f.Fuzz(func(t *testing.T, input string) {
+		if input == "seed" {
+			t.Log("seed-ok")
+		}
+	})
+}
+
+-- tagged_test.go --
+//go:build testprefix
+
+package bar
+
+import "testing"
+
+func TestTaggedFlag(t *testing.T) {}
 -- bar_separate_test.go --
 package bar_test
 

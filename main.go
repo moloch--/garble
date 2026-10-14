@@ -30,7 +30,7 @@ import (
 	"strings"
 	"time"
 
-	"mvdan.cc/garble/internal/linker"
+	"mvdan.cc/garble/internal/patcher"
 )
 
 const actionGraphFileName = "action-graph.json"
@@ -94,12 +94,20 @@ var booleanFlags = map[string]bool{
 	"-x":          true,
 
 	// Test flags (TODO: support its special -args flag)
-	"-benchmem": true,
-	"-c":        true,
-	"-failfast": true,
-	"-fullpath": true,
-	"-json":     true,
-	"-short":    true,
+	"-artifacts": true,
+	"-benchmem":  true,
+	"-c":         true,
+	"-failfast":  true,
+	"-fullpath":  true,
+	"-json":      true,
+	"-short":     true,
+
+	"-test.artifacts": true,
+	"-test.benchmem":  true,
+	"-test.failfast":  true,
+	"-test.fullpath":  true,
+	"-test.short":     true,
+	"-test.v":         true,
 }
 
 var flagSet = flag.NewFlagSet("garble", flag.ExitOnError)
@@ -241,7 +249,7 @@ func mainErr(args []string) error {
 		return commandMap(args)
 	case "bug":
 		return commandBug(args)
-	case "build", "test", "run":
+	case "build", "test", "run", "install":
 		cmd, err := toolexecCmd(command, args)
 		defer func() {
 			if err := os.RemoveAll(os.Getenv("GARBLE_SHARED")); err != nil {
@@ -310,20 +318,53 @@ func mainErr(args []string) error {
 		}
 
 		executablePath := args[0]
-		if tool == "link" {
-			modifiedLinkPath, unlock, err := linker.PatchLinker(sharedCache.GoEnv.GOROOT, sharedCache.GoEnv.GOVERSION, sharedCache.CacheDir, sharedTempDir)
+		switch tool {
+		case "compile":
+			pkgPathMap, symbolMap := buildRuntimePkgPathMap(), buildSymbolMap()
+			if pkgPathMap == "" && symbolMap == "" {
+				break
+			}
+			modifiedPath, err := patcher.PatchCompiler(
+				os.Getenv(patcher.GoSrcEnv), sharedCache.GoEnv.GOROOT,
+				sharedCache.GoEnv.GOVERSION, sharedCache.CacheDir, sharedTempDir,
+			)
+			if err != nil {
+				return fmt.Errorf("cannot get modified compiler: %v", err)
+			}
+			executablePath = modifiedPath
+			os.Setenv(patcher.PkgPathMapEnv, pkgPathMap)
+			os.Setenv(patcher.SymbolMapEnv, symbolMap)
+			log.Printf("replaced compiler with: %s", executablePath)
+		case "asm":
+			pkgPathMap, symbolMap := buildRuntimePkgPathMap(), buildSymbolMap()
+			if pkgPathMap == "" && symbolMap == "" {
+				break
+			}
+			modifiedPath, err := patcher.PatchAssembler(
+				os.Getenv(patcher.GoSrcEnv), sharedCache.GoEnv.GOROOT,
+				sharedCache.GoEnv.GOVERSION, sharedCache.CacheDir, sharedTempDir,
+			)
+			if err != nil {
+				return fmt.Errorf("cannot get modified assembler: %v", err)
+			}
+			executablePath = modifiedPath
+			os.Setenv(patcher.PkgPathMapEnv, pkgPathMap)
+			os.Setenv(patcher.SymbolMapEnv, symbolMap)
+			log.Printf("replaced assembler with: %s", executablePath)
+		case "link":
+			modifiedPath, err := patcher.PatchLinker(
+				sharedCache.GoEnv.GOROOT, sharedCache.GoEnv.GOVERSION,
+				sharedCache.CacheDir, sharedTempDir,
+			)
 			if err != nil {
 				return fmt.Errorf("cannot get modified linker: %v", err)
 			}
-			defer unlock()
-
-			executablePath = modifiedLinkPath
-			os.Setenv(linker.MagicValueEnv, strconv.FormatUint(uint64(magicValue()), 10))
-			os.Setenv(linker.EntryOffKeyEnv, strconv.FormatUint(uint64(entryOffKey()), 10))
-			// Do not allow a value inherited from the caller to select tiny
-			// linker behavior for a regular build.
-			os.Setenv(linker.TinyEnv, strconv.FormatBool(flagTiny))
-
+			executablePath = modifiedPath
+			os.Setenv(patcher.MagicValueEnv, strconv.FormatUint(uint64(magicValue()), 10))
+			os.Setenv(patcher.EntryOffKeyEnv, strconv.FormatUint(uint64(entryOffKey()), 10))
+			os.Setenv(patcher.TinyEnv, strconv.FormatBool(flagTiny))
+			os.Setenv(patcher.PkgPathMapEnv, buildRuntimePkgPathMap())
+			os.Setenv(patcher.SymbolMapEnv, buildSymbolMap())
 			log.Printf("replaced linker with: %s", executablePath)
 		}
 
@@ -353,12 +394,11 @@ func startPatchingLinker() {
 	go func() {
 		defer close(patchedLinkerDone)
 		startTime := time.Now()
-		_, unlock, err := linker.PatchLinker(sharedCache.GoEnv.GOROOT, sharedCache.GoEnv.GOVERSION, sharedCache.CacheDir, sharedTempDir)
+		_, err := patcher.PatchLinker(sharedCache.GoEnv.GOROOT, sharedCache.GoEnv.GOVERSION, sharedCache.CacheDir, sharedTempDir)
 		if err != nil {
 			log.Printf("could not prepare the linker ahead of time: %v", err)
 			return
 		}
-		unlock()
 		log.Printf("prepared the linker in %s", debugSince(startTime))
 	}()
 }
@@ -380,6 +420,38 @@ func toolexecCmd(command string, args []string) (*exec.Cmd, error) {
 	// Split the flags from the package arguments, since we'll need
 	// to run 'go list' on the same set of packages.
 	flags, args := splitFlagsFromArgs(args)
+	var trailingFlags []string
+	if command == "test" {
+		// Go accepts test and build flags after the package list as well.
+		for i, arg := range args {
+			if strings.HasPrefix(arg, "-") {
+				trailingFlags = args[i:]
+				break
+			}
+		}
+	}
+	// Go handles a leading -C before loading module and toolchain settings.
+	// Consume it here so our injected flags do not precede it in nested calls.
+	if len(flags) > 0 {
+		first := flags[0]
+		if strings.HasPrefix(first, "--") {
+			first = first[1:]
+		}
+		if first == "-C" || strings.HasPrefix(first, "-C=") {
+			var dir string
+			if first == "-C" {
+				if len(flags) < 2 {
+					return nil, fmt.Errorf("flag needs an argument: -C")
+				}
+				dir, flags = flags[1], flags[2:]
+			} else {
+				dir, flags = strings.TrimPrefix(first, "-C="), flags[1:]
+			}
+			if err := os.Chdir(dir); err != nil {
+				return nil, err
+			}
+		}
+	}
 	if hasHelpFlag(flags) {
 		out, _ := exec.Command("go", command, "-h").CombinedOutput()
 		fmt.Fprintf(os.Stderr, `
@@ -395,6 +467,9 @@ This command wraps "go %s". Below is its help:
 			return nil, fmt.Errorf("garble flags must precede command, like: garble %s build ./pkg", flag)
 		}
 	}
+	if value := os.Getenv("GOGARBLE"); value != "" && value != "*" {
+		return nil, fmt.Errorf("GOGARBLE=%q is no longer supported; all packages including the runtime are obfuscated now", value)
+	}
 
 	// Here is the only place we initialize the cache.
 	// The sub-processes will parse it from a shared file.
@@ -402,7 +477,8 @@ This command wraps "go %s". Below is its help:
 
 	// Note that we also need to pass build flags to 'go list', such
 	// as -tags.
-	sharedCache.ForwardBuildFlags, _ = filterForwardBuildFlags(flags)
+	allFlags := append(append([]string(nil), flags...), trailingFlags...)
+	sharedCache.ForwardBuildFlags, _ = filterForwardBuildFlags(allFlags)
 	if command == "test" {
 		sharedCache.ForwardBuildFlags = append(sharedCache.ForwardBuildFlags, "-test")
 	}
@@ -464,7 +540,21 @@ This command wraps "go %s". Below is its help:
 		startPatchingLinker()
 	}
 
-	if listErr := appendListedPackages(args, true); listErr != nil {
+	listArgs := args
+	if len(trailingFlags) > 0 {
+		listArgs = args[:len(args)-len(trailingFlags)]
+	}
+	if command == "run" && len(args) > 0 {
+		// go run accepts either one package or a sequence of .go files.
+		// Everything after the target is passed to the program itself.
+		listArgs = args[:1]
+		if strings.HasSuffix(args[0], ".go") {
+			for len(listArgs) < len(args) && strings.HasSuffix(args[len(listArgs)], ".go") {
+				listArgs = args[:len(listArgs)+1]
+			}
+		}
+	}
+	if listErr := appendListedPackages(listArgs, true); listErr != nil {
 		// A Go tool which can't be run at all fails here as well as in the
 		// background fetch above; prefer that error, as it is the root cause.
 		if err := <-binaryContentID; err != nil {
@@ -664,6 +754,7 @@ Similarly, to combine garble flags and Go build flags:
 The following commands are supported:
 
 	build          replace "go build"
+	install        replace "go install"
 	test           replace "go test"
 	run            replace "go run"
 	reverse        de-obfuscate output such as stack traces
@@ -702,6 +793,12 @@ func filterForwardBuildFlags(flags []string) (filtered []string, firstUnknown st
 			// Either "-bool" or "-name=value".
 			continue
 		}
+		// Go test accepts unknown test-binary flags, whose arity we cannot
+		// know. A following flag-shaped token is parsed independently by Go,
+		// including when the unknown flag is boolean.
+		if !buildFlag && i+1 < len(flags) && strings.HasPrefix(flags[i+1], "-") {
+			continue
+		}
 		// "-name value", so the next arg is part of this flag.
 		if i++; buildFlag && i < len(flags) {
 			filtered = append(filtered, flags[i])
@@ -735,11 +832,27 @@ func rejectUnknownBuildFlags(flags []string) error {
 //	compile [flags...] -p pkg/path.go [more flags...] file1.go file2.go
 //
 // For now, since those confusing flags are always followed by more flags,
-// iterating in reverse order works around them entirely.
+// iterating in reverse order works around them entirely. Source overlays can
+// have arbitrary backing-file names; cmd/go identifies them in -trimpath.
 func splitFlagsFromFiles(all []string, ext string) (flags, paths []string) {
+	var overlayFiles map[string]bool
+	for rewrite := range strings.SplitSeq(flagValue(all, "-trimpath"), ";") {
+		from, to, ok := strings.Cut(rewrite, "=>")
+		if ok && strings.HasSuffix(to, ext) {
+			if overlayFiles == nil {
+				overlayFiles = make(map[string]bool)
+			}
+			overlayFiles[filepath.Clean(from)] = true
+		}
+	}
 	for i := len(all) - 1; i >= 0; i-- {
 		arg := all[i]
-		if strings.HasPrefix(arg, "-") || !strings.HasSuffix(arg, ext) {
+		isFile := strings.HasSuffix(arg, ext)
+		if !isFile && len(overlayFiles) > 0 {
+			abs, err := filepath.Abs(arg)
+			isFile = err == nil && overlayFiles[abs]
+		}
+		if strings.HasPrefix(arg, "-") || !isFile {
 			cutoff := i + 1 // arg is a flag, not a path
 			return all[:cutoff:cutoff], all[cutoff:]
 		}
@@ -827,13 +940,17 @@ To install Go, see: https://go.dev/doc/install
 	// to one of the available versions. Given that later we build a patched linker
 	// from GOROOT/src via `go build -overlay`, we need to resolve any symlinks.
 	// Note that this edge case has no tests as it's relatively rare.
-	sharedCache.GoEnv.GOROOT, err = filepath.EvalSymlinks(sharedCache.GoEnv.GOROOT)
-	if err != nil {
-		return err
+	//
+	// EvalSymlinks can fail on Windows for some valid paths, such as those on
+	// Namespace cache volumes, so keep GOROOT as-is when that happens.
+	goroot := sharedCache.GoEnv.GOROOT
+	if resolved, err := filepath.EvalSymlinks(goroot); err != nil {
+		log.Printf("cannot resolve symlinks in GOROOT %q: %v", goroot, err)
+	} else {
+		sharedCache.GoEnv.GOROOT = resolved
 	}
 
 	sharedCache.GoCmd = filepath.Join(sharedCache.GoEnv.GOROOT, "bin", "go")
-	sharedCache.GOGARBLE = cmp.Or(os.Getenv("GOGARBLE"), "*") // we default to obfuscating everything
 	return nil
 }
 

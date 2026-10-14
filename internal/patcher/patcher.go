@@ -1,0 +1,600 @@
+// Copyright (c) 2026, The Garble Authors.
+// See LICENSE for licensing information.
+
+package patcher
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"embed"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"go/version"
+	"io"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/bluekeyes/go-gitdiff/gitdiff"
+	"github.com/rogpeppe/go-internal/lockedfile"
+)
+
+const (
+	PkgPathMapEnv = "GARBLE_PKGPATH_MAP"
+	SymbolMapEnv  = "GARBLE_SYMBOL_MAP"
+
+	MagicValueEnv  = "GARBLE_LINK_MAGIC"
+	TinyEnv        = "GARBLE_LINK_TINY"
+	EntryOffKeyEnv = "GARBLE_LINK_ENTRYOFF_KEY"
+	// GoSrcEnv can be set to override Go source files while building patched tools.
+	GoSrcEnv = "GARBLE_GO_SRC"
+
+	// Bump when tool patch/build semantics change to invalidate cached binaries.
+	toolchainBuildVersion = "v4"
+)
+
+// Files that we may need to overlay from the modified source while building
+// cmd/compile and cmd/asm.
+var compilerOverlayFiles = []string{
+	"cmd/compile/internal/ssagen/intrinsics.go",
+	"cmd/compile/internal/ssa/rewrite.go",
+	"cmd/compile/internal/types/pkg.go",
+	"cmd/compile/internal/types/size.go",
+	"cmd/compile/internal/types/type.go",
+	"cmd/compile/internal/types2/sizes.go",
+	"cmd/compile/internal/ir/abi.go",
+	"cmd/compile/internal/ir/func.go",
+	"cmd/compile/internal/base/flag.go",
+	"cmd/compile/internal/base/garble.go",
+	"cmd/compile/internal/escape/call.go",
+	"cmd/compile/internal/inline/inl.go",
+	"cmd/compile/internal/walk/expr.go",
+	"cmd/compile/internal/noder/helpers.go",
+	"cmd/compile/internal/noder/reader.go",
+	"cmd/compile/internal/ssagen/nowb.go",
+	"cmd/compile/internal/typecheck/syms.go",
+	"cmd/compile/internal/reflectdata/reflect.go",
+	"cmd/internal/obj/x86/asm6.go",
+	"cmd/internal/obj/x86/seh.go",
+	"cmd/internal/obj/ppc64/obj9.go",
+	"cmd/internal/obj/wasm/wasmobj.go",
+	"cmd/internal/objabi/garble.go",
+	"cmd/internal/objabi/funcid.go",
+	"cmd/internal/objabi/pkgspecial.go",
+}
+
+// Files that we may need to overlay from the modified source while building
+// cmd/link.
+var linkerOverlayFiles = []string{
+	"cmd/link/internal/loader/loader.go",
+	"cmd/link/internal/ld/pcln.go",
+	"cmd/link/internal/ld/deadcode.go",
+	"cmd/link/internal/ld/dwarf.go",
+	"cmd/link/internal/ld/lib.go",
+	"cmd/link/internal/ld/symtab.go",
+	"cmd/link/internal/ld/data.go",
+	"cmd/link/internal/ld/main.go",
+	"cmd/link/internal/ld/inittask.go",
+	"cmd/link/internal/ld/xcoff.go",
+	"cmd/link/internal/ppc64/asm.go",
+	"cmd/link/internal/arm/asm.go",
+	"cmd/link/internal/arm64/asm.go",
+	"cmd/link/internal/loong64/asm.go",
+	"cmd/link/internal/riscv64/asm.go",
+	"cmd/link/internal/wasm/asm.go",
+	"cmd/internal/goobj/builtin.go",
+	"cmd/internal/objabi/garble.go",
+	"cmd/internal/objabi/funcid.go",
+	"cmd/internal/objabi/pkgspecial.go",
+}
+
+//go:embed patches/*/*.patch
+var toolchainPatchesFS embed.FS
+
+func loadToolchainPatches(majorGoVersion string) (version string, sourceFiles, patchFiles, deletedFiles map[string]bool, patches [][]byte, expectedAppliedPatches int, err error) {
+	sourceFiles = make(map[string]bool)
+	patchFiles = make(map[string]bool)
+	deletedFiles = make(map[string]bool)
+
+	versionHash := sha256.New()
+	if err := fs.WalkDir(toolchainPatchesFS, "patches/"+majorGoVersion, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+
+		patchBytes, err := toolchainPatchesFS.ReadFile(path)
+		if err != nil {
+			return err
+		}
+
+		if _, err := versionHash.Write(patchBytes); err != nil {
+			return err
+		}
+
+		files, _, err := gitdiff.Parse(bytes.NewReader(patchBytes))
+		if err != nil {
+			return err
+		}
+		expectedAppliedPatches += len(files)
+		for _, file := range files {
+			if file.IsCopy || file.IsRename {
+				return fmt.Errorf("unsupported patch operation (copy/rename) for %q", file.OldName)
+			}
+			if !file.IsNew {
+				sourceFiles[file.OldName] = true
+			}
+			if file.IsDelete {
+				deletedFiles[file.OldName] = true
+				continue
+			}
+			patchFiles[file.NewName] = true
+		}
+		patches = append(patches, patchBytes)
+		return nil
+	}); err != nil {
+		return "", nil, nil, nil, nil, 0, err
+	}
+	version = base64.RawStdEncoding.EncodeToString(versionHash.Sum(nil))
+	return
+}
+
+func copyFile(src, target string) error {
+	targetDir := filepath.Dir(target)
+	if err := os.MkdirAll(targetDir, 0o777); err != nil {
+		return err
+	}
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	targetFile, err := os.Create(target)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(targetFile, srcFile); err != nil {
+		targetFile.Close()
+		return err
+	}
+	return targetFile.Close()
+}
+
+func fileExists(path string) bool {
+	stat, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return !stat.IsDir()
+}
+
+// TODO(pagran): Remove git dependency in future.
+// More information in README.md.
+func applyPatches(srcDir, workingDir string, sourceFiles map[string]bool, patches [][]byte, expectedAppliedPatches int) error {
+	for fileName := range sourceFiles {
+		oldPath := filepath.Join(srcDir, fileName)
+		newPath := filepath.Join(workingDir, fileName)
+		if err := copyFile(oldPath, newPath); err != nil {
+			return err
+		}
+	}
+
+	// If one of parent folders of workingDir contains repository, set current directory is not enough because git
+	// by default treats workingDir as a subfolder of repository, so it will break git apply. Adding --git-dir flag blocks this behavior.
+	cmd := exec.Command("git", "--git-dir", workingDir, "apply", "--verbose")
+	cmd.Dir = workingDir
+	// Ensure that the output messages are in plain English.
+	cmd.Env = append(cmd.Env, "LC_ALL=C")
+	cmd.Stdin = bytes.NewReader(bytes.Join(patches, []byte("\n")))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to 'git apply' patches: %v:\n%s", err, out)
+	}
+
+	// Running git without errors does not guarantee that all patches have been applied.
+	// Make sure that all passed patches have been applied correctly.
+	rx := regexp.MustCompile(`(?m)^Applied patch .+ cleanly\.$`)
+	if appliedPatches := len(rx.FindAllIndex(out, -1)); appliedPatches != expectedAppliedPatches {
+		return fmt.Errorf("expected %d applied patches, actually %d:\n\n%s", expectedAppliedPatches, appliedPatches, string(out))
+	}
+	return nil
+}
+
+func buildPatchOverlay(goRoot, workingDir string, patchFiles, deletedFiles map[string]bool) map[string]string {
+	overlay := make(map[string]string)
+	for fileName := range patchFiles {
+		systemPath := filepath.Join(goRoot, "src", fileName)
+		patchedPath := filepath.Join(workingDir, fileName)
+		overlay[systemPath] = patchedPath
+	}
+	for fileName := range deletedFiles {
+		systemPath := filepath.Join(goRoot, "src", fileName)
+		overlay[systemPath] = ""
+	}
+	return overlay
+}
+
+func makeFileSet(files []string) map[string]bool {
+	set := make(map[string]bool, len(files))
+	for _, file := range files {
+		set[file] = true
+	}
+	return set
+}
+
+func filterFiles(files map[string]bool, allowedFiles []string) map[string]bool {
+	allowed := makeFileSet(allowedFiles)
+	filtered := make(map[string]bool)
+	for file := range files {
+		if allowed[file] {
+			filtered[file] = true
+		}
+	}
+	return filtered
+}
+
+func mirrorGoRoot(source, target string) error {
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(target, 0o777); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		sourcePath := filepath.Join(source, entry.Name())
+		targetPath := filepath.Join(target, entry.Name())
+		if err := os.Symlink(sourcePath, targetPath); err == nil {
+			continue
+		}
+		// Directory symlinks can require elevated privileges on Windows. Fall
+		// back to a directory tree of hard links, copying only across filesystems.
+		if entry.IsDir() {
+			if err := mirrorGoRoot(sourcePath, targetPath); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.Link(sourcePath, targetPath); err == nil {
+			continue
+		}
+		if err := copyFile(sourcePath, targetPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isModuleToolchainGoRoot(goRoot string) bool {
+	clean := filepath.Clean(goRoot)
+	return strings.HasPrefix(filepath.Base(clean), "toolchain@") &&
+		filepath.Base(filepath.Dir(clean)) == "golang.org"
+}
+
+func normalizeGoRoot(goRoot, tempDir string) (string, error) {
+	// Toolchain upgrades via GOTOOLCHAIN can point GOROOT into GOMODCACHE, and
+	// go build overlays cannot replace files at module-cache paths. Mirror the
+	// selected GOROOT outside GOMODCACHE while keeping every entry tied to that
+	// exact toolchain; substituting the host GOROOT would mix Go versions.
+	if !isModuleToolchainGoRoot(goRoot) {
+		return goRoot, nil
+	}
+	sum := sha256.Sum256([]byte(goRoot))
+	mirrorRoot := filepath.Join(tempDir, fmt.Sprintf("toolchain-%x", sum[:8]))
+	mutex := lockedfile.MutexAt(mirrorRoot + lockExt)
+	unlock, err := mutex.Lock()
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	completePath := filepath.Join(mirrorRoot, ".complete")
+	if fileExists(completePath) {
+		return mirrorRoot, nil
+	}
+	if err := os.RemoveAll(mirrorRoot); err != nil {
+		return "", err
+	}
+	if err := mirrorGoRoot(goRoot, mirrorRoot); err != nil {
+		os.RemoveAll(mirrorRoot)
+		return "", fmt.Errorf("cannot mirror selected GOROOT: %w", err)
+	}
+	if err := os.WriteFile(completePath, nil, 0o666); err != nil {
+		os.RemoveAll(mirrorRoot)
+		return "", err
+	}
+	return mirrorRoot, nil
+}
+
+func cachePathForTool(cacheDir, toolName string) (string, error) {
+	cacheDir = filepath.Join(cacheDir, "tool")
+	if err := os.MkdirAll(cacheDir, 0o777); err != nil {
+		return "", err
+	}
+	goExe := ""
+	if runtime.GOOS == "windows" {
+		goExe = ".exe"
+	}
+	return filepath.Join(cacheDir, toolName+goExe), nil
+}
+
+// Like cmd/go's GOCACHE, record uses via mtimes and trim after days of disuse.
+const (
+	// Cached tools unused for this long are removed when building a new tool.
+	toolTrimAge = 5 * 24 * time.Hour
+	// Limits how often a cached tool's mtime is updated to record its use.
+	toolUsedInterval = time.Hour
+)
+
+// markToolUsed records that a cached tool is in use via its mtime,
+// so that [trimToolCache] keeps it.
+func markToolUsed(toolPath string, mtime, now time.Time) {
+	if now.Sub(mtime) > toolUsedInterval {
+		os.Chtimes(toolPath, now, now) // best-effort
+	}
+}
+
+// trimToolCache removes cached tools which have not been used in [toolTrimAge],
+// as well as any unversioned tools left behind by older Garble versions.
+// Removal is best-effort, as a tool may be running on Windows.
+func trimToolCache(cacheDir string, now time.Time) {
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return
+	}
+	// Group each tool with its version and lock files.
+	lastUsed := make(map[string]time.Time)
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		name := strings.TrimSuffix(entry.Name(), versionExt)
+		name = strings.TrimSuffix(name, lockExt)
+		if t := info.ModTime(); t.After(lastUsed[name]) {
+			lastUsed[name] = t
+		}
+	}
+	for name, t := range lastUsed {
+		versioned := strings.Contains(name, "-") // see [versionedToolName]
+		if versioned && now.Sub(t) < toolTrimAge {
+			continue
+		}
+		for _, suffix := range []string{"", versionExt, lockExt} {
+			os.Remove(filepath.Join(cacheDir, name+suffix))
+		}
+	}
+}
+
+func versionedToolName(toolName, goVersion, patchVersion string) string {
+	sum := sha256.Sum256([]byte(goVersion + "\x00" + patchVersion))
+	return fmt.Sprintf("%s-%x", toolName, sum[:8])
+}
+
+func getCurrentVersion(goVersion, patchesVer string) string {
+	// Note that we assume that if a Go toolchain reports itself as e.g. go1.24.1,
+	// it really is that upstream Go version with no alterations or edits.
+	// If any modifications are made, it should report itself as e.g. go1.24.1-corp.
+	// The alternative would be to use the content ID hash of the binary.
+	return goVersion + " " + patchesVer + "\n"
+}
+
+const (
+	versionExt = ".version"
+	lockExt    = ".lock"
+)
+
+func checkVersion(toolPath, goVersion, patchesVer string) (bool, error) {
+	versionPath := toolPath + versionExt
+	version, err := os.ReadFile(versionPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	return string(version) == getCurrentVersion(goVersion, patchesVer), nil
+}
+
+func writeVersion(toolPath, goVersion, patchesVer string) error {
+	versionPath := toolPath + versionExt
+	return os.WriteFile(versionPath, []byte(getCurrentVersion(goVersion, patchesVer)), 0o777)
+}
+
+// hashFiles returns the SHA256 hash of multiple files' contents.
+func hashFiles(paths []string) (string, error) {
+	h := sha256.New()
+	for _, path := range paths {
+		f, err := os.Open(path)
+		if err != nil {
+			return "", err
+		}
+		if _, err := io.Copy(h, f); err != nil {
+			f.Close()
+			return "", err
+		}
+		f.Close()
+	}
+	return base64.RawStdEncoding.EncodeToString(h.Sum(nil)), nil
+}
+
+func collectOverlayFiles(goSrcRoot, goRoot string, patchFiles map[string]bool, extraFiles []string) (relFiles []string, absFiles []string) {
+	if goSrcRoot == "" || goSrcRoot == goRoot {
+		return nil, nil
+	}
+
+	seen := make(map[string]bool)
+	for file := range patchFiles {
+		modifiedPath := filepath.Join(goSrcRoot, "src", file)
+		if fileExists(modifiedPath) {
+			seen[file] = true
+		}
+	}
+	for _, file := range extraFiles {
+		modifiedPath := filepath.Join(goSrcRoot, "src", file)
+		if fileExists(modifiedPath) {
+			seen[file] = true
+		}
+	}
+
+	for file := range seen {
+		relFiles = append(relFiles, file)
+	}
+	slices.Sort(relFiles)
+
+	for _, file := range relFiles {
+		absFiles = append(absFiles, filepath.Join(goSrcRoot, "src", file))
+	}
+	return relFiles, absFiles
+}
+
+func buildTool(goRoot, workingDir string, overlay map[string]string, outputPath, toolPkg string) error {
+	file, err := json.Marshal(&struct{ Replace map[string]string }{overlay})
+	if err != nil {
+		return err
+	}
+	overlayPath := filepath.Join(workingDir, "overlay.json")
+	if err := os.WriteFile(overlayPath, file, 0o777); err != nil {
+		return err
+	}
+
+	goCmd := filepath.Join(goRoot, "bin", "go")
+	cmd := exec.Command(goCmd, "build", "-overlay", overlayPath, "-o", outputPath, toolPkg)
+	// The tool is run by Garble on this machine, so build it for the platform
+	// Garble runs on, ignoring the settings for the target of the main build.
+	// Later entries take precedence, and cmd/go treats empty values as unset.
+	cmd.Env = append(os.Environ(),
+		"GOENV=off", "GOEXPERIMENT=", "GOFLAGS=", "GOTOOLCHAIN=",
+		"GOOS="+runtime.GOOS, "GOARCH="+runtime.GOARCH,
+		// The target's architecture levels, such as GOAMD64=v3,
+		// could result in a tool which the host cannot run.
+		// See the list in cmd/go/internal/cfg.
+		"GO386=", "GOAMD64=", "GOARM=", "GOARM64=", "GOMIPS=", "GOMIPS64=",
+		"GOPPC64=", "GORISCV64=", "GOWASM=",
+		"GOROOT="+goRoot,
+		"GOMODCACHE="+filepath.Join(workingDir, "gomodcache"),
+		"GOPROXY=off",
+	)
+	cmd.Dir = workingDir
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s compile error: %v\n\n%s", toolPkg, err, string(out))
+	}
+
+	return nil
+}
+
+func toolWorkspaceDir(tempDir, outputPath string) string {
+	return filepath.Join(tempDir, filepath.Base(outputPath)+"-src")
+}
+
+func patchAndBuildTool(toolName, toolPkg, goSrcRoot, goRoot, goVersion, cacheDir, tempDir string, extraOverlayFiles []string) (string, error) {
+	patchesVer, sourceFiles, patchFiles, deletedFiles, patches, expectedAppliedPatches, err := loadToolchainPatches(version.Lang(goVersion))
+	if err != nil {
+		return "", fmt.Errorf("cannot retrieve toolchain patches: %v", err)
+	}
+
+	toolPatchFiles := filterFiles(patchFiles, extraOverlayFiles)
+	toolDeletedFiles := filterFiles(deletedFiles, extraOverlayFiles)
+
+	overlayRelFiles, overlayAbsFiles := collectOverlayFiles(goSrcRoot, goRoot, toolPatchFiles, extraOverlayFiles)
+	overlayHash := ""
+	if len(overlayAbsFiles) > 0 {
+		overlayHash, err = hashFiles(overlayAbsFiles)
+		if err != nil {
+			return "", fmt.Errorf("cannot hash toolchain overlay files: %v", err)
+		}
+	}
+	fullVersion := patchesVer + "-" + overlayHash + "-" + toolchainBuildVersion
+
+	// Versioned paths make cached tools immutable. Apart from retaining tools
+	// across Garble invocations, this lets concurrent compile actions release
+	// the build lock before executing the cached tool.
+	outputPath, err := cachePathForTool(cacheDir, versionedToolName(toolName, goVersion, fullVersion))
+	if err != nil {
+		return "", err
+	}
+
+	mutex := lockedfile.MutexAt(outputPath + lockExt)
+	unlock, err := mutex.Lock()
+	if err != nil {
+		return "", err
+	}
+
+	lockHeld := true
+	defer func() {
+		if lockHeld {
+			unlock()
+		}
+	}()
+
+	isCorrectVer, err := checkVersion(outputPath, goVersion, fullVersion)
+	if err != nil {
+		return "", err
+	}
+	if info, err := os.Stat(outputPath); isCorrectVer && err == nil && !info.IsDir() {
+		unlock()
+		lockHeld = false
+		markToolUsed(outputPath, info.ModTime(), time.Now())
+		return outputPath, nil
+	}
+
+	// Only mirror GOROOT once we know we need to build the tool, as it
+	// is costly without symlinks, needing hard links or copies of every file.
+	buildGoRoot, err := normalizeGoRoot(goRoot, tempDir)
+	if err != nil {
+		return "", err
+	}
+	srcDir := filepath.Join(buildGoRoot, "src")
+	// The workspace follows the immutable output key. Different Go versions or
+	// overlay hashes therefore never remove or rewrite one another's sources.
+	workingDir := toolWorkspaceDir(tempDir, outputPath)
+	if err := os.RemoveAll(workingDir); err != nil {
+		return "", err
+	}
+	if err := applyPatches(srcDir, workingDir, sourceFiles, patches, expectedAppliedPatches); err != nil {
+		return "", err
+	}
+
+	overlay := buildPatchOverlay(buildGoRoot, workingDir, toolPatchFiles, toolDeletedFiles)
+	for _, file := range overlayRelFiles {
+		systemPath := filepath.Join(buildGoRoot, "src", file)
+		modifiedPath := filepath.Join(goSrcRoot, "src", file)
+		overlay[systemPath] = modifiedPath
+	}
+
+	if err := buildTool(buildGoRoot, workingDir, overlay, outputPath, toolPkg); err != nil {
+		return "", err
+	}
+	if err := writeVersion(outputPath, goVersion, fullVersion); err != nil {
+		return "", err
+	}
+
+	unlock()
+	lockHeld = false
+	// Building a new tool is rare, and typically means that Go or Garble were
+	// upgraded, so it is a good time to remove unused tools.
+	trimToolCache(filepath.Dir(outputPath), time.Now())
+	return outputPath, nil
+}
+
+func PatchCompiler(goSrcRoot, goRoot, goVersion, cacheDir, tempDir string) (string, error) {
+	return patchAndBuildTool("compile", "cmd/compile", goSrcRoot, goRoot, goVersion, cacheDir, tempDir, compilerOverlayFiles)
+}
+
+func PatchAssembler(goSrcRoot, goRoot, goVersion, cacheDir, tempDir string) (string, error) {
+	return patchAndBuildTool("asm", "cmd/asm", goSrcRoot, goRoot, goVersion, cacheDir, tempDir, compilerOverlayFiles)
+}
+
+func PatchLinker(goRoot, goVersion, cacheDir, tempDir string) (string, error) {
+	goSrcRoot := os.Getenv(GoSrcEnv)
+	return patchAndBuildTool("link", "cmd/link", goSrcRoot, goRoot, goVersion, cacheDir, tempDir, linkerOverlayFiles)
+}

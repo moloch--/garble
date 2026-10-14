@@ -1,0 +1,29 @@
+# Listing the build target alongside linknamed packages with -pgo=auto makes
+# Go report crypto/md5 and net/url under variant paths. An explicit profile
+# filename applies the profile to every package and does not reproduce the bug.
+# An empty CPU profile is sufficient; no benchmark or CPU samples are needed.
+go test -p=2 -run=^$ -cpuprofile=default.pgo .
+rm pgo.test$exe
+exec garble build -p=2 -pgo=auto -o=app$exe .
+exec ./app
+stdout '900150983cd24fb0d6963f7d28e17f72'
+
+-- go.mod --
+module example.com/pgo
+
+go 1.27
+-- main.go --
+package main
+
+import (
+    "crypto/md5"
+    "fmt"
+    "net/url"
+)
+
+func main() {
+    u, _ := url.Parse("https://example.com/abc")
+    fmt.Printf("%x\n", md5.Sum([]byte(u.Path[1:])))
+}
+-- prof_test.go --
+package main

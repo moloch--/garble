@@ -9,6 +9,12 @@ stderr '^\*main\.TaintedLate$'
 stderr '^\*main\.FirstParam$'
 stderr '^\*main\.SecondParam$'
 
+# A constant MethodByName must not retain unrelated exported methods.
+exec garble build -o methods-bin$exe ./methods
+exec ./methods-bin$exe
+stdout '^used$'
+! binsubstr methods-bin$exe 'unused-method-marker'
+
 [short] stop # no need to verify this with -short
 
 # Check that the program works as expected without garble.
@@ -45,7 +51,45 @@ import (
 
 var Sink interface{}
 
+type TemplateField struct{ Label, Type string }
+type TemplateData struct {
+	TypeName string
+	Fields   []TemplateField
+}
+
+// Templates can invoke methods whose interface-typed results hide their
+// concrete type from the static type of the Execute argument.
+type optionData struct{}
+type optionResult struct{ CurrentOpt struct{ Value string } }
+
+func (optionData) IterateOption() any {
+	var result optionResult
+	result.CurrentOpt.Value = "Option1"
+	return result
+}
+
+type mergedOptionResult struct{ MergedOpt struct{ Label string } }
+
+func (optionData) IterateMergedOption() any {
+	var result mergedOptionResult
+	result.MergedOpt.Label = "Merged"
+	var value any = result
+	if len(os.Args) > 1 {
+		value = 42
+	}
+	return value
+}
+
+type methodCallReceiver struct{}
+
+func (methodCallReceiver) M() string { return "M called" }
+
 func main() {
+	var methodReceiver any = methodCallReceiver{}
+	fmt.Println(reflect.ValueOf(methodReceiver).Method(0).Call(nil)[0])
+
+	checkReflectedRecover()
+
 	// Fields still work fine when they are not obfuscated.
 	fmt.Println(importedpkg.ReflectInDefinedVar.ExportedField2)
 	fmt.Println(importedpkg.ReflectInDefined{ExportedField2: 5})
@@ -79,6 +123,31 @@ func main() {
 		Port:  8080,
 	})
 	fmt.Println() // Always print a newline.
+
+	// Indexing a slice returned by append hides the value's SSA origin, but
+	// the static type still tells us which fields a template must be able to see.
+	items := append([]TemplateData(nil), TemplateData{
+		TypeName: "MyStruct",
+		Fields:   []TemplateField{{Label: "name", Type: "STRING"}},
+	})
+	tmpl = template.Must(template.New("slice").Parse("TYPE {{.TypeName}}: {{range .Fields}}{{.Label}}={{.Type}}{{end}}"))
+	if err := tmpl.Execute(os.Stdout, items[0]); err != nil {
+		panic(err)
+	}
+	fmt.Println()
+
+	// A template calls a method returning any, then inspects fields on the
+	// concrete value returned by the method (as survey/v2 does for options).
+	tmpl = template.Must(template.New("options").Parse(`{{define "option"}}{{.CurrentOpt.Value}}{{end}}{{template "option" .IterateOption}}`))
+	if err := tmpl.Execute(os.Stdout, optionData{}); err != nil {
+		panic(err)
+	}
+	fmt.Println()
+	tmpl = template.Must(template.New("merged options").Parse(`{{.IterateMergedOption.MergedOpt.Label}}`))
+	if err := tmpl.Execute(os.Stdout, optionData{}); err != nil {
+		panic(err)
+	}
+	fmt.Println()
 
 	// Another complex case, involving embedding and another package.
 	outer := &importedpkg.EmbeddingOuter{}
@@ -220,6 +289,19 @@ func main() {
 	hopToSink(&TaintedLate{TaintedLateField: "late"})
 
 	callBothTypes()
+
+	// SSA gives range-over-func defers a synthetic $ssa.deferStack type.
+	for i := range rangeFuncSequence {
+		defer fmt.Println("range defer", i)
+	}
+}
+
+func rangeFuncSequence(yield func(int) bool) {
+	for i := 0; i < 3; i++ {
+		if !yield(i) {
+			return
+		}
+	}
 }
 
 type EmbeddingIndirect struct {
@@ -718,7 +800,70 @@ type IndirectNamedWithoutReflect struct {
 	DuplicateFieldName int
 }
 
+-- methods/main.go --
+package main
+
+import (
+	"fmt"
+	"reflect"
+)
+
+type T struct{}
+
+func (T) Used() string   { return "used" }
+func (T) Unused() string { return "unused-method-marker" }
+
+func main() {
+	it := reflect.TypeOf((*interface{ Used() string })(nil)).Elem()
+	if m, ok := it.MethodByName("Used"); !ok || m.Name != "Used" {
+		panic("interface Used not found")
+	}
+	m, ok := reflect.TypeOf(T{}).MethodByName("Used")
+	if !ok {
+		panic("Used not found")
+	}
+	fmt.Println(m.Func.Call([]reflect.Value{reflect.ValueOf(T{})})[0].String())
+}
+
+-- recover.go --
+package main
+
+import (
+	"fmt"
+	"reflect"
+)
+
+func report(name string, r any) {
+	if r != "boom" {
+		panic(fmt.Sprintf("%s recovered %v, want boom", name, r))
+	}
+	fmt.Println("ok", name)
+}
+
+type recoverReceiver struct{}
+
+func (recoverReceiver) M() { report("Method", recover()) }
+
+func checkReflectedRecover() {
+	func() {
+		f := reflect.MakeFunc(reflect.TypeOf((func())(nil)), func([]reflect.Value) []reflect.Value {
+			report("MakeFunc", recover())
+			return nil
+		}).Interface().(func())
+		defer f()
+		panic("boom")
+	}()
+	func() {
+		f := reflect.ValueOf(recoverReceiver{}).Method(0).Interface().(func())
+		defer f()
+		panic("boom")
+	}()
+}
+
 -- main.stdout --
+M called
+ok MakeFunc
+ok Method
 9000
 {5 0 {}}
 ReflectTypeOf
@@ -729,6 +874,9 @@ ReflectValueOf{ExportedField:"abc", unexportedField:""}
 {"Foo":3}
 Hello Dave.
 name: test value: example port: 8080
+TYPE MyStruct: name=STRING
+Option1
+Merged
 {"InnerField":3,"Anon":{"AnonField":0}}
 struct { DownstreamField string }{DownstreamField:"downstream"}
 SiblingField:"sibling"
@@ -745,3 +893,6 @@ TypeOfParent's own name: TypeOfParent
 TypeOfParent named: TypeOfNamedField NamedReflectionField
 TypeOfParent embedded: TypeOfEmbeddedField EmbeddedReflectionField
 main.Connection
+range defer 2
+range defer 1
+range defer 0

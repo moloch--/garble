@@ -48,6 +48,16 @@ stdin main-literals.stderr
 ! exec garble reverse .
 cmp stdout main-literals.stderr
 
+# A source //line directive supplies a logical filename and line, not just a line.
+go build -trimpath -o line-plain$exe ./case/line
+exec ./line-plain$exe
+cp stdout line.expected
+exec garble -literals build -o line-obfuscated$exe ./case/line
+exec ./line-obfuscated$exe
+stdin stdout
+exec garble -literals reverse ./case/line
+cmp stdout line.expected
+
 # https://github.com/burrowers/garble/pull/967
 # Ensure that we can reverse a package with build tag required.
 exec garble build -o tag.bin -tags sometag ./case/tag
@@ -66,6 +76,7 @@ go 1.23
 package main
 
 import (
+	"log"
 	"os"
 	"runtime"
 
@@ -75,10 +86,20 @@ import (
 func main() {
 	unexportedMainFunc()
 
+	// A decoded literal inside a chained call must not leave a position
+	// that garble reverse cannot recognize (issue #762).
+	log.SetFlags(log.Llongfile)
+	(&Logger{}).Fields("marker", "[request]").Info("first")
+
 	_, filename, _, _ := runtime.Caller(0)
 	println()
 	println("main filename:", filename)
 }
+
+type Logger struct{}
+
+func (l *Logger) Fields(args ...any) *Logger { return l }
+func (l *Logger) Info(message string) { _ = log.Output(2, message) }
 
 func unexportedMainFunc() {
 	anonFunc := func() {
@@ -135,6 +156,26 @@ func printStackTrace(w io.Writer) error {
 	return err
 }
 
+-- case/line/main.go --
+package main
+
+import (
+	"fmt"
+	"runtime"
+)
+
+func main() {
+//line virtual/rewritten.go:317
+	_, file, line, _ := runtime.Caller(0)
+	fmt.Printf("logical=%s:%d\n", file, line)
+	fmt.Printf("logical-file=%s\n", file)
+	fmt.Println("distinct-literal-message-in-logical-frame")
+//line /virtual/absolute.go:410
+	_, file, line, _ = runtime.Caller(0)
+	fmt.Printf("absolute=%s:%d\n", file, line)
+	fmt.Printf("absolute-file=%s\n", file)
+}
+
 -- case/tag/main.go --
 //go:build sometag
 
@@ -161,10 +202,11 @@ test/main/lib.printStackTrace(...)
 test/main/lib.(*ExportedLibType).ExportedLibMethod(...)
 	test/main/lib/long_lib.go:20 +0x??
 main.unexportedMainFunc.func1(...)
-	test/main/long_main.go:21
+	test/main/long_main.go:32
 main.unexportedMainFunc(...)
-	test/main/long_main.go:25 +0x??
+	test/main/long_main.go:36 +0x??
 main.main(...)
-	test/main/long_main.go:11 +0x??
+	test/main/long_main.go:12 +0x??
+test/main/long_main.go:17: first
 
 main filename: test/main/long_main.go

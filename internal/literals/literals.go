@@ -10,7 +10,7 @@ import (
 	"go/token"
 	"go/types"
 	mathrand "math/rand"
-	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/tools/go/ast/astutil"
 	ah "mvdan.cc/garble/internal/asthelper"
@@ -49,7 +49,8 @@ func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkString
 			// so obfuscating strings in these is less important in any case.
 			if node.Doc != nil {
 				for _, comment := range node.Doc.List {
-					if strings.HasPrefix(comment.Text, "//go:nosplit") {
+					dir, ok := ast.ParseDirective(token.NoPos, comment.Text)
+					if ok && dir.Tool == "go" && dir.Name == "nosplit" {
 						return false
 					}
 				}
@@ -70,6 +71,35 @@ func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkString
 			}
 
 		case ast.Expr:
+			// A constant string converted to a byte or rune slice has an
+			// exact capacity. Decoding first can make the allocation larger.
+			if call, ok := node.(*ast.CallExpr); ok && len(call.Args) == 1 {
+				if slice, ok := info.TypeOf(call.Fun).Underlying().(*types.Slice); ok && (slice.Elem() == types.Universe.Lookup("byte").Type() || slice.Elem() == types.Universe.Lookup("rune").Type()) {
+					elem := slice.Elem()
+					if value := info.Types[call.Args[0]].Value; value != nil && value.Kind() == constant.String {
+						text := constant.StringVal(value)
+						if len(text) >= MinSize && len(text) <= MaxSize {
+							size := len(text)
+							if elem == types.Universe.Lookup("rune").Type() {
+								size = utf8.RuneCountInString(text)
+							}
+							name := or.nameFunc(or.rnd, "literalSlice")
+							result := ast.NewIdent(name)
+							converted := ah.CallExpr(call.Fun, obfuscateString(or, text))
+							body := ah.BlockStmt(
+								ah.AssignDefineStmt(result, converted),
+								ah.ReturnStmt(&ast.SliceExpr{
+									X:    ast.NewIdent(name),
+									High: ah.IntLit(size),
+									Max:  ah.IntLit(size),
+								}),
+							)
+							cursor.Replace(withPos(ah.LambdaCall(nil, call.Fun, body, nil), node.Pos()))
+							return false
+						}
+					}
+				}
+			}
 			// Rewrite &[]byte{...} as a whole on the way down. Rewriting the
 			// composite literal on its own would leave behind &(decoder()),
 			// which is not addressable, and parentheses in the input would
@@ -129,6 +159,30 @@ func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkString
 	newFile.Decls = append(newFile.Decls, or.liftedFuncs...)
 	or.proxyDispatcher.AddToFile(newFile)
 	return newFile
+}
+
+// generatedNames assigns each decoder-local name before building its AST.
+// References receive fresh Ident nodes with the same generated spelling.
+type generatedNames struct {
+	r     *obfRand
+	names map[string]string
+}
+
+func newGeneratedNames(r *obfRand) *generatedNames {
+	return &generatedNames{r: r, names: make(map[string]string)}
+}
+
+func (n *generatedNames) name(original string) string {
+	if name, ok := n.names[original]; ok {
+		return name
+	}
+	name := n.r.nameFunc(n.r.rnd, "literalLocal"+original)
+	n.names[original] = name
+	return name
+}
+
+func (n *generatedNames) ident(original string) *ast.Ident {
+	return ast.NewIdent(n.name(original))
 }
 
 // liftCall moves a literal decoder out of its owner function and makes it a
@@ -324,12 +378,13 @@ func obfuscateString(or *obfRand, data string) *ast.CallExpr {
 	or.rnd.Read(junkBytes)
 	splitIdx := or.rnd.Intn(len(junkBytes))
 
-	extKeys := randExtKeys(or.rnd)
+	names := newGeneratedNames(or)
+	extKeys := randExtKeys(or.rnd, names)
 
 	plainData := []byte(data)
 	plainDataWithJunkBytes := append(append(junkBytes[:splitIdx], plainData...), junkBytes[splitIdx:]...)
 
-	block := obf.obfuscate(or.rnd, plainDataWithJunkBytes, extKeys)
+	block := obf.obfuscate(or.rnd, names, plainDataWithJunkBytes, extKeys)
 	params, args := extKeysToParams(or, extKeys)
 
 	// Generate unique cast bytes to string function and hide it using proxyDispatcher:
@@ -348,7 +403,7 @@ func obfuscateString(or *obfRand, data string) *ast.CallExpr {
 	funcVal := &ast.FuncLit{
 		Type: &ast.FuncType{
 			Params: &ast.FieldList{List: []*ast.Field{{
-				Names: []*ast.Ident{ast.NewIdent("x")},
+				Names: []*ast.Ident{names.ident("x")},
 				Type:  ah.ByteSliceType(),
 			}}},
 			Results: &ast.FieldList{List: []*ast.Field{{
@@ -359,7 +414,7 @@ func obfuscateString(or *obfRand, data string) *ast.CallExpr {
 			ah.ReturnStmt(
 				ah.CallExprByName("string",
 					&ast.SliceExpr{
-						X:    ast.NewIdent("x"),
+						X:    names.ident("x"),
 						Low:  ah.IntLit(splitIdx),
 						High: ah.IntLit(splitIdx + len(plainData)),
 					},
@@ -369,39 +424,41 @@ func obfuscateString(or *obfRand, data string) *ast.CallExpr {
 	}
 	castFunc := or.liftFuncValue(funcVal)
 	hiddenCastFunc := or.proxyDispatcher.HideValue(castFunc, funcTyp)
-	const castParamName = "garbleStringCaster"
+	castParamName := names.name("garbleStringCaster")
 	params.List = append(params.List, &ast.Field{
 		Names: []*ast.Ident{ast.NewIdent(castParamName)},
 		Type:  cloneGeneratedType(funcTyp),
 	})
 	args = append(args, hiddenCastFunc)
-	block.List = append(block.List, ah.ReturnStmt(ah.CallExpr(ast.NewIdent(castParamName), ast.NewIdent("data"))))
+	block.List = append(block.List, ah.ReturnStmt(ah.CallExpr(ast.NewIdent(castParamName), names.ident("data"))))
 	return or.liftCall(params, ast.NewIdent("string"), block, args)
 }
 
 func obfuscateByteSlice(or *obfRand, isPointer bool, data []byte) *ast.CallExpr {
 	obf := or.pickObfuscator(len(data))
 
-	extKeys := randExtKeys(or.rnd)
-	block := obf.obfuscate(or.rnd, data, extKeys)
+	names := newGeneratedNames(or)
+	extKeys := randExtKeys(or.rnd, names)
+	block := obf.obfuscate(or.rnd, names, data, extKeys)
 	params, args := extKeysToParams(or, extKeys)
 
 	if isPointer {
 		block.List = append(block.List, ah.ReturnStmt(
-			ah.UnaryExpr(token.AND, ast.NewIdent("data")),
+			ah.UnaryExpr(token.AND, names.ident("data")),
 		))
 		return or.liftCall(params, ah.StarExpr(ah.ByteSliceType()), block, args)
 	}
 
-	block.List = append(block.List, ah.ReturnStmt(ast.NewIdent("data")))
+	block.List = append(block.List, ah.ReturnStmt(names.ident("data")))
 	return or.liftCall(params, ah.ByteSliceType(), block, args)
 }
 
 func obfuscateByteArray(or *obfRand, isPointer bool, data []byte, length int64) *ast.CallExpr {
 	obf := or.pickObfuscator(len(data))
 
-	extKeys := randExtKeys(or.rnd)
-	block := obf.obfuscate(or.rnd, data, extKeys)
+	names := newGeneratedNames(or)
+	extKeys := randExtKeys(or.rnd, names)
+	block := obf.obfuscate(or.rnd, names, data, extKeys)
 	params, args := extKeysToParams(or, extKeys)
 
 	arrayType := ah.ByteArrayType(length)
@@ -411,25 +468,25 @@ func obfuscateByteArray(or *obfRand, isPointer bool, data []byte, length int64) 
 			Decl: &ast.GenDecl{
 				Tok: token.VAR,
 				Specs: []ast.Spec{&ast.ValueSpec{
-					Names: []*ast.Ident{ast.NewIdent("newdata")},
+					Names: []*ast.Ident{names.ident("newdata")},
 					Type:  arrayType,
 				}},
 			},
 		},
 		&ast.RangeStmt{
-			Key: ast.NewIdent("i"),
+			Key: names.ident("i"),
 			Tok: token.DEFINE,
-			X:   ast.NewIdent("data"),
+			X:   names.ident("data"),
 			Body: ah.BlockStmt(
 				ah.AssignStmt(
-					ah.IndexExprByExpr(ast.NewIdent("newdata"), ast.NewIdent("i")),
-					ah.IndexExprByExpr(ast.NewIdent("data"), ast.NewIdent("i")),
+					ah.IndexExprByExpr(names.ident("newdata"), names.ident("i")),
+					ah.IndexExprByExpr(names.ident("data"), names.ident("i")),
 				),
 			),
 		},
 	}
 
-	var retexpr ast.Expr = ast.NewIdent("newdata")
+	var retexpr ast.Expr = names.ident("newdata")
 	if isPointer {
 		retexpr = ah.UnaryExpr(token.AND, retexpr)
 	}

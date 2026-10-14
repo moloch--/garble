@@ -34,10 +34,10 @@ order to:
 * [Obfuscate literals](#literal-obfuscation), if the `-literals` flag is given
 * Remove [extra information](#tiny-mode), if the `-tiny` flag is given
 
-By default, the tool obfuscates all the packages being built.
-You can manually specify which packages to obfuscate via `GOGARBLE`,
-a comma-separated list of glob patterns matching package path prefixes.
-This format is borrowed from `GOPRIVATE`; see `go help private`.
+The tool obfuscates all supported packages being built, including the standard runtime.
+The unsupported `runtime/cgo` and `crypto/internal/fips140` packages are excluded.
+Runtime obfuscation follows Go's supported `GOOS`/`GOARCH` targets; Garble does not
+maintain a narrower architecture allowlist.
 
 Note that commands like `garble build` will use the `go` version found in your
 `$PATH`. To use different versions of Go, you can [use `GOTOOLCHAIN`](https://go.dev/doc/toolchain).
@@ -148,8 +148,7 @@ to document the current shortcomings of this tool.
   be required by interfaces. This area is a work in progress; see
   [#3](https://github.com/burrowers/garble/issues/3).
 
-* Aside from `GOGARBLE` to select patterns of packages to obfuscate,
-  there is no supported way to exclude obfuscating a selection of files or packages.
+* There is no supported way to exclude obfuscating a selection of files or packages.
   More often than not, a user would want to do this to work around a bug; please file the bug instead.
 
 * Go programs [are initialized](https://go.dev/ref/spec#Program_initialization) one package at a time,
@@ -174,3 +173,6 @@ We welcome new contributors. If you would like to contribute, see
 
 Please file an issue before sending a PR, whether it is a bug report or a
 feature request, so that we can agree on the problem and its solution first.
+
+
+[![CI powered by Namespace](https://namespace.so/oss/badge.svg)](https://namespace.so/github-actions/?utm_source=oss&utm_campaign=garble)

@@ -1,5 +1,42 @@
 # Changelog
 
+## [v0.18.0] - 2026-09-19
+
+This release adds support for Go 1.27 and drops support for Go 1.26.
+
+Builds are now 10% to 15% faster, depending on the size of the build and the
+number of spare CPU cores, as the patched linker is now built in the background
+while packages are listed rather than right before linking.
+
+Experimental control flow obfuscation via `//garble:controlflow` is now
+reproducible for a given `-seed`, and handles many more Go constructs:
+bound method values, generic conversions, types declared in block scopes,
+named map and string types, blank struct fields, and comma-ok receives in
+`select`. Ranging over a string now reports byte offsets as the key, as Go does.
+
+`-tiny` now strips more identifying information from binaries: the text of
+fatal error messages routed through standard packages, and Linux runtime VMA
+labels. When linking externally, the native build ID added by the C toolchain
+is now stripped as well, except on macOS, where dyld requires it.
+
+`-tiny` also no longer breaks runtime behavior which depends on function names,
+such as `panicwrap`'s recoverable panics and the GC argument maps for reflect
+calls; the latter could affect memory safety in regular builds too.
+
+The detection of types used with reflection now repeats until it settles,
+rather than stopping after a single pass, so reflection use which spreads over
+a long chain of calls is no longer missed.
+
+A number of fixes are also included:
+* Allow the implicit dependencies which the go command adds for the linker,
+  such as `runtime/cgo` when linking externally
+* Resolve test-variant dependencies by their suffixed key; see #1018
+* Don't obfuscate string literals nested inside constant expressions
+* Obfuscate parenthesized `&[]byte{...}` literals; see #1056
+* Preserve the capacity of decoded byte slice literals; see #1057
+* Don't reference generic type aliases when keeping imports alive; see #1069
+* Don't patch and build the linker for `garble reverse` and `garble map`
+
 ## [v0.17.0] - 2026-07-26
 
 This release continues support for Go 1.26.
@@ -381,6 +418,7 @@ Known bugs:
 * obfuscating the standard library with `GOPRIVATE=*` is not well supported yet
 * `garble test` is temporarily disabled, as it is currently broken
 
+[v0.18.0]: https://github.com/burrowers/garble/releases/tag/v0.18.0
 [v0.17.0]: https://github.com/burrowers/garble/releases/tag/v0.17.0
 [v0.16.0]: https://github.com/burrowers/garble/releases/tag/v0.16.0
 [v0.15.0]: https://github.com/burrowers/garble/releases/tag/v0.15.0

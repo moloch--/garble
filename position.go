@@ -19,7 +19,7 @@ var printBuf1, printBuf2 bytes.Buffer
 // printFile prints a Go file to a buffer, while also removing non-directive
 // comments and adding extra compiler directives to obfuscate position information.
 func printFile(lpkg *listedPackage, file *ast.File) ([]byte, error) {
-	if lpkg.ToObfuscate {
+	if lpkg.toObfuscate() {
 		// Omit comments from the final Go code.
 		// Keep directives, as they affect the build.
 		// We do this before printing to print fewer bytes below.
@@ -27,7 +27,7 @@ func printFile(lpkg *listedPackage, file *ast.File) ([]byte, error) {
 		for _, group := range file.Comments {
 			var newGroup ast.CommentGroup
 			for _, comment := range group.List {
-				if strings.HasPrefix(comment.Text, "//go:") {
+				if isGoDirective(comment.Text) {
 					newGroup.List = append(newGroup.List, comment)
 				}
 			}
@@ -45,10 +45,16 @@ func printFile(lpkg *listedPackage, file *ast.File) ([]byte, error) {
 	}
 	src := printBuf1.Bytes()
 
-	if !lpkg.ToObfuscate {
+	if !lpkg.toObfuscate() {
 		// We lightly transform packages which shouldn't be obfuscated,
 		// such as when rewriting go:linkname directives to obfuscated packages.
 		// We still need to print the files, but without obfuscating positions.
+		return src, nil
+	}
+	// Tiny mode strips source positions in the linker, so directives are unnecessary.
+	// Don't obfuscate positions in runtime - the //line directives confuse
+	// the compiler's linkname verification
+	if flagTiny || lpkg.ImportPath == "runtime" {
 		return src, nil
 	}
 
@@ -111,7 +117,7 @@ func printFile(lpkg *listedPackage, file *ast.File) ([]byte, error) {
 			// Before we removed the comments from file.Comments,
 			// but go/printer also grabs comments from some Doc ast.Node fields.
 			// TODO: is there an easy way to filter all comments at once?
-			if strings.HasPrefix(lit, "//go:") {
+			if isGoDirective(lit) {
 				continue // directives are kept
 			}
 			offset := fsetFile.Position(pos).Offset
@@ -151,4 +157,11 @@ func printFile(lpkg *listedPackage, file *ast.File) ([]byte, error) {
 			fmt.Fprintf(&printBuf2, " /*line %s%s:1*/ ", newPrefix, newName)
 		}
 	}
+}
+
+// isGoDirective reports whether a comment is a Go toolchain directive,
+// such as "//go:linkname" or "//go:build".
+func isGoDirective(comment string) bool {
+	dir, ok := ast.ParseDirective(token.NoPos, comment)
+	return ok && dir.Tool == "go"
 }
