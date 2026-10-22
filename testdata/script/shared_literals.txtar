@@ -1,0 +1,47 @@
+! exec garble -literals-shared build
+stderr '-literals-shared requires -literals'
+
+! exec garble build -literals-shared
+stderr 'must precede command, like: garble -literals-shared build'
+
+env LDFLAGS='-X=main.linked=LINKED_SHARED_STRING_SECRET_194_2026'
+
+exec garble -literals -literals-shared -seed=MTIzNDU2Nzg build -ldflags=${LDFLAGS} -o shared$exe
+exec ./shared$exe
+cmp stderr want.stderr
+! binsubstr shared$exe 'GLOBAL_SHARED_STRING_SECRET_194_2026' 'LOCAL_SHARED_STRING_SECRET_194_2026' 'MUTABLE_BYTES_STRING_SECRET_194_2026' 'LINKED_SHARED_STRING_SECRET_194_2026' 'EMBEDDED_SHARED_STRING_SECRET_194_2026'
+
+exec garble -literals -seed=MTIzNDU2Nzg build -ldflags=${LDFLAGS} -o default$exe
+exec ./default$exe
+cmp stderr want.stderr
+
+-- go.mod --
+module test/main
+
+go 1.23
+-- main.go --
+package main
+
+import _ "embed"
+
+var global = "GLOBAL_SHARED_STRING_SECRET_194_2026"
+var linked = "LINKED_INITIAL_STRING_SECRET_194_2026"
+
+//go:embed embedded.txt
+var embedded string
+
+func main() {
+	for i := 0; i < 2; i++ {
+		local := "LOCAL_SHARED_STRING_SECRET_194_2026"
+		bytes := []byte("MUTABLE_BYTES_STRING_SECRET_194_2026")
+		if len(bytes) != 36 || cap(bytes) != 36 { panic("incorrect byte slice capacity") }
+		if len(embedded) < 32 || embedded[0] != 'E' { panic("incorrect embedded string") }
+		println(global, local, string(bytes), linked, "embedded-ok")
+		bytes[0] = '!'
+	}
+}
+-- embedded.txt --
+EMBEDDED_SHARED_STRING_SECRET_194_2026
+-- want.stderr --
+GLOBAL_SHARED_STRING_SECRET_194_2026 LOCAL_SHARED_STRING_SECRET_194_2026 MUTABLE_BYTES_STRING_SECRET_194_2026 LINKED_SHARED_STRING_SECRET_194_2026 embedded-ok
+GLOBAL_SHARED_STRING_SECRET_194_2026 LOCAL_SHARED_STRING_SECRET_194_2026 MUTABLE_BYTES_STRING_SECRET_194_2026 LINKED_SHARED_STRING_SECRET_194_2026 embedded-ok

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/constant"
+	"go/parser"
 	"go/token"
 	"go/types"
 	mathrand "math/rand"
@@ -39,15 +40,27 @@ const (
 // NameProviderFunc defines a function type that generates a string based on a random source and a base name.
 type NameProviderFunc func(rand *mathrand.Rand, baseName string) string
 
+// Options selects optional literal transformations. The zero value preserves
+// Garble's default literal obfuscation.
+type Options struct {
+	SharedStrings bool
+}
+
 // EmbeddedValue bypasses the minimum size threshold for resolved //go:embed data.
 type EmbeddedValue struct {
 	Data   []byte
 	String bool
 }
 
-// Obfuscate replaces literals with obfuscated anonymous functions.
+// Obfuscate replaces literals using the default transformations.
 func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkStrings map[*types.Var]string, embeds map[ast.Expr]EmbeddedValue, nameFunc NameProviderFunc) *ast.File {
+	return ObfuscateWithOptions(rand, file, info, linkStrings, embeds, nameFunc, Options{})
+}
+
+// ObfuscateWithOptions replaces literals using the selected transformations.
+func ObfuscateWithOptions(rand *mathrand.Rand, file *ast.File, info *types.Info, linkStrings map[*types.Var]string, embeds map[ast.Expr]EmbeddedValue, nameFunc NameProviderFunc, options Options) *ast.File {
 	or := newObfRand(rand, file, nameFunc)
+	or.sharedStrings = options.SharedStrings
 	// Package initializers, including their function literals, keep a shared
 	// dispatcher. Each original function declaration gets a separate tree so
 	// a live function cannot retain another function's lifted decoders.
@@ -422,6 +435,14 @@ func obfuscateString(or *obfRand, data string) *ast.CallExpr {
 	if call := or.stringCalls[data]; call != nil {
 		return or.proxyDispatcher.cloneStringCall(call).(*ast.CallExpr)
 	}
+	if or.sharedStrings && len(data) >= 32 {
+		call := or.sharedBlobStringCall(data)
+		if or.stringCalls != nil {
+			or.stringCalls[data] = call
+			return or.proxyDispatcher.cloneStringCall(call).(*ast.CallExpr)
+		}
+		return call
+	}
 	obf := or.pickObfuscator(len(data))
 
 	// Generate junk bytes to to prepend and append to the data.
@@ -453,6 +474,69 @@ func obfuscateString(or *obfRand, data string) *ast.CallExpr {
 		return or.proxyDispatcher.cloneStringCall(call).(*ast.CallExpr)
 	}
 	return call
+}
+
+func (or *obfRand) sharedBlobStringCall(data string) *ast.CallExpr {
+	if or.blobStringDecoder == "" {
+		or.blobStringDecoder = or.nextLiftedFuncName("sharedBlobStringDecoder")
+		body := sharedBlobDecodeBody()
+		source := fmt.Sprintf("package p\nfunc %s(input string, low, high int) string { decode := func(input string) []byte %s; return string(decode(input)[low:high]) }", or.blobStringDecoder, body)
+		parsed, err := parser.ParseFile(token.NewFileSet(), "", source, 0)
+		if err != nil {
+			panic(err)
+		}
+		or.liftedFuncs = append(or.liftedFuncs, parsed.Decls...)
+	}
+	junkBytes := make([]byte, or.rnd.Intn(maxStringJunkBytes-minStringJunkBytes)+minStringJunkBytes)
+	or.rnd.Read(junkBytes)
+	splitIdx := or.rnd.Intn(len(junkBytes))
+	plain := []byte(data)
+	plainWithJunk := append(append(junkBytes[:splitIdx], plain...), junkBytes[splitIdx:]...)
+	encoded := encodeSharedBlob(or.rnd, plainWithJunk)
+	return ah.CallExpr(ast.NewIdent(or.blobStringDecoder), ah.StringLit(string(encoded)), ah.IntLit(splitIdx), ah.IntLit(splitIdx+len(plain)))
+}
+
+// The selected literal calls always contain a mode and a key followed by ciphertext.
+// Unlike embed.FS blobs, these values need no magic header: a fixed marker
+// would make extraction from a binary unnecessarily simple.
+func sharedBlobDecodeBody() string {
+	keySize := BlobHeaderSize - len(BlobMagic)
+	return fmt.Sprintf(`{
+mode := input[0]
+key := input[1:%d]
+decoded := []byte(input[%d:])
+for i, b := range decoded {
+ k := key[i %% len(key)]
+ switch mode {
+ case 0: decoded[i] = b ^ k
+ case 1: decoded[i] = b - k
+ case 2: decoded[i] = b + k
+ default: x := b ^ k; decoded[i] = x >> 3 | x << 5
+ }
+}
+return decoded[:len(decoded):len(decoded)]
+}`, keySize+1, keySize+1)
+}
+
+func encodeSharedBlob(rand *mathrand.Rand, plain []byte) []byte {
+	encoded := EncodeBlob(rand, plain)[len(BlobMagic):]
+	keySize := BlobHeaderSize - len(BlobMagic)
+	key, ciphertext := encoded[:keySize], encoded[keySize:]
+	mode := byte(rand.Intn(4))
+	for i, b := range plain {
+		k := key[i%len(key)]
+		switch mode {
+		case 0:
+			ciphertext[i] = b ^ k
+		case 1:
+			ciphertext[i] = b + k
+		case 2:
+			ciphertext[i] = b - k
+		case 3:
+			ciphertext[i] = (b<<3 | b>>5) ^ k
+		}
+	}
+	return append([]byte{mode}, encoded...)
 }
 
 // Each use needs independent positions; only the hidden values and decoder are
