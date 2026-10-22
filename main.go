@@ -113,14 +113,15 @@ var booleanFlags = map[string]bool{
 }
 
 var flagSet = flag.NewFlagSet("garble", flag.ExitOnError)
-var rxGarbleFlag = regexp.MustCompile(`-(?:literals|tiny|debug|debugdir|seed)(?:$|=)`)
+var rxGarbleFlag = regexp.MustCompile(`-(?:literals|literals-shared|tiny|debug|debugdir|seed)(?:$|=)`)
 
 var (
-	flagLiterals bool
-	flagTiny     bool
-	flagDebug    bool
-	flagDebugDir string
-	flagSeed     seedFlag
+	flagLiterals       bool
+	flagLiteralsShared bool
+	flagTiny           bool
+	flagDebug          bool
+	flagDebugDir       string
+	flagSeed           seedFlag
 	// TODO(pagran): in the future, when control flow obfuscation will be stable migrate to flag
 	flagControlFlow = os.Getenv("GARBLE_EXPERIMENTAL_CONTROLFLOW") == "1"
 
@@ -133,6 +134,7 @@ var (
 func init() {
 	flagSet.Usage = usage
 	flagSet.BoolVar(&flagLiterals, "literals", false, "Obfuscate literals and embedded files")
+	flagSet.BoolVar(&flagLiteralsShared, "literals-shared", false, "Share a mixed-operation decoder across strings of at least 32 bytes (requires -literals; smaller binaries with weaker literal obfuscation)")
 	flagSet.BoolVar(&flagTiny, "tiny", false, "Optimize for binary size, losing some ability to reverse the process")
 	flagSet.BoolVar(&flagDebug, "debug", false, "Print debug logs to stderr")
 	flagSet.StringVar(&flagDebugDir, "debugdir", "", "Write source and obfuscated trees to a directory, e.g. -debugdir=out")
@@ -221,6 +223,9 @@ func (e errJustExit) Error() string { return fmt.Sprintf("exit: %d", e) }
 
 func mainErr(args []string) error {
 	command, args := args[0], args[1:]
+	if flagLiteralsShared && !flagLiterals {
+		return fmt.Errorf("-literals-shared requires -literals")
+	}
 
 	// Catch users reaching for `go build -toolexec=garble`.
 	if command != "toolexec" && len(args) == 1 && args[0] == "-V=full" {

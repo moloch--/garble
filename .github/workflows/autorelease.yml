@@ -44,6 +44,21 @@ jobs:
       - name: Darwin (arm64)
         run: GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o ./bin/garble_darwin-arm64 .
 
+      - name: Verify build provenance
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          commit="$(git rev-parse HEAD)"
+          count=0
+          for file in ./bin/garble_*; do
+            metadata="$(go version -m "$file")"
+            grep -Fq "vcs.revision=$commit" <<< "$metadata"
+            grep -Fq 'vcs.modified=false' <<< "$metadata"
+            grep -Fq 'CGO_ENABLED=0' <<< "$metadata"
+            count=$((count + 1))
+          done
+          test "$count" -eq 6
+
       - name: "Publish Release"
         env:
           GH_TOKEN: ${{ github.token }}
