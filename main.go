@@ -71,6 +71,7 @@ var forwardBuildFlags = map[string]bool{
 	"-pkgdir":        true,
 	"-race":          true,
 	"-tags":          true,
+	"-test":          true, // go list -test loads test variants for reverse.
 	"-work":          true,
 	"-workfile":      true,
 }
@@ -101,6 +102,7 @@ var booleanFlags = map[string]bool{
 	"-fullpath":  true,
 	"-json":      true,
 	"-short":     true,
+	"-test":      true,
 
 	"-test.artifacts": true,
 	"-test.benchmem":  true,
@@ -130,7 +132,7 @@ var (
 
 func init() {
 	flagSet.Usage = usage
-	flagSet.BoolVar(&flagLiterals, "literals", false, "Obfuscate literals such as strings")
+	flagSet.BoolVar(&flagLiterals, "literals", false, "Obfuscate literals and embedded files")
 	flagSet.BoolVar(&flagTiny, "tiny", false, "Optimize for binary size, losing some ability to reverse the process")
 	flagSet.BoolVar(&flagDebug, "debug", false, "Print debug logs to stderr")
 	flagSet.StringVar(&flagDebugDir, "debugdir", "", "Write source and obfuscated trees to a directory, e.g. -debugdir=out")
@@ -479,6 +481,13 @@ This command wraps "go %s". Below is its help:
 	// as -tags.
 	allFlags := append(append([]string(nil), flags...), trailingFlags...)
 	sharedCache.ForwardBuildFlags, _ = filterForwardBuildFlags(allFlags)
+	if flagLiterals {
+		for value := range flagValues(allFlags, "-ldflags") {
+			if value = strings.TrimSpace(value); value != "" && !strings.HasPrefix(value, "-") {
+				return nil, fmt.Errorf("package patterns in -ldflags are not supported with -literals; use unpatterned flags and build commands separately")
+			}
+		}
+	}
 	if command == "test" {
 		sharedCache.ForwardBuildFlags = append(sharedCache.ForwardBuildFlags, "-test")
 	}

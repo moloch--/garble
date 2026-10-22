@@ -31,7 +31,7 @@ order to:
 * Replace identifiers and package paths with short base64 hashes
 * Replace position information with short base64 hashed filenames
 * Remove all [build](https://go.dev/pkg/runtime/#Version), [module](https://go.dev/pkg/runtime/debug/#ReadBuildInfo), and debug information
-* [Obfuscate literals](#literal-obfuscation), if the `-literals` flag is given
+* [Obfuscate literals](#literal-obfuscation) and [embedded files](#embedded-file-obfuscation), if the `-literals` flag is given
 * Remove [extra information](#tiny-mode), if the `-tiny` flag is given
 
 The tool obfuscates all supported packages being built, including the standard runtime.
@@ -72,12 +72,36 @@ replaced with more complex expressions, resolving to the same value at run-time.
 String literals injected via `-ldflags=-X` are also replaced by this flag.
 This feature is opt-in, as it can cause slow-downs depending on the input code.
 
+Injected strings use the same size limits as source literals. Variables in the
+runtime and its dependencies are not covered. With `-literals`, `-ldflags` must
+be unpatterned; build commands separately if they need different injected values.
+
 Literals used in constant expressions cannot be obfuscated, since they are
 resolved at compile time. This includes any expressions part of a `const`
 declaration, for example.
 
 Note that this process can be reversed given enough effort;
 see [#984](https://github.com/burrowers/garble/issues/984).
+
+### Embedded file obfuscation
+
+The `-literals` flag also obfuscates files included with `//go:embed`.
+It supports `string`, `[]byte`, and `embed.FS`, including named string and
+byte-slice types. Garble leaves the original files untouched.
+
+Contents are decoded at run time:
+
+* Embedded string and byte-slice variables are decoded during package initialization.
+* Files in an `embed.FS` are decoded each time they are opened. Paths, directory
+  entries, file sizes, seeking, and `ReadAt` behavior are unchanged.
+
+Embedded variables use the same obfuscation algorithms as source literals.
+Values larger than 2 KiB and `embed.FS` contents share a simpler decoder that
+scales to large files. Decoding adds runtime work; opening files in an `embed.FS`
+also allocates temporary buffers.
+
+Embedded filenames remain visible. This is obfuscation, not encryption:
+the executable contains the decoding key, so its contents can still be recovered.
 
 ### Tiny mode
 

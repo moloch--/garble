@@ -10,10 +10,9 @@ import (
 )
 
 const (
-	// minStructCount is the minimum number of proxyStructs initialized in the dispatcher.
-	minStructCount = 4
-	// maxStructCount is the maximum number of proxyStructs initialized in the dispatcher.
-	maxStructCount = 8
+	// proxyValuesPerStruct sets the scaffold budget from actual occupancy;
+	// one or two randomized extra structs keep small trees from being uniform.
+	proxyValuesPerStruct = 64
 	//minChildCount defines the minimum number of child elements that can be assigned to proxy structs.
 	minChildCount = 1
 	// maxChildCount defines the maximum number of child elements that can be assigned to proxy structs.
@@ -35,6 +34,8 @@ const (
 type proxyValue struct {
 	name     string
 	typ, val ast.Expr
+	path     *ast.SelectorExpr
+	clones   []*ast.SelectorExpr
 }
 
 type proxyStruct struct {
@@ -51,18 +52,25 @@ type proxyRoot struct {
 	root           *proxyStruct
 	flattenStructs []*proxyStruct
 	hiddenCount    int
+	pending        []*proxyValue
 }
 
 type proxyDispatcher struct {
 	rand     *mathrand.Rand
 	nameFunc NameProviderFunc
 
-	roots []*proxyRoot
+	roots        []*proxyRoot
+	pendingPaths map[*ast.SelectorExpr]*proxyValue
+
+	// Keep the conversion helper within the same retention boundary as its decoders.
+	stringAdapter     ast.Expr
+	stringAdapterType *ast.FuncType
 }
 
-func (d *proxyDispatcher) initialize() *proxyRoot {
-	rootIndex := strconv.Itoa(len(d.roots))
-	flattenStructs := make([]*proxyStruct, d.rand.Intn(maxStructCount-minStructCount)+minStructCount)
+func (d *proxyDispatcher) initialize(proxyRoot *proxyRoot, index int) {
+	rootIndex := strconv.Itoa(index)
+	base := (proxyRoot.hiddenCount + proxyValuesPerStruct - 1) / proxyValuesPerStruct
+	flattenStructs := make([]*proxyStruct, base+d.rand.Intn(min(base, 2)+1))
 	for i := range flattenStructs {
 		flattenStructs[i] = &proxyStruct{
 			typeName:  d.nameFunc(d.rand, "proxyRoot"+rootIndex+"StructName"+strconv.Itoa(i)),
@@ -95,12 +103,22 @@ func (d *proxyDispatcher) initialize() *proxyRoot {
 		}
 	}
 
-	proxyRoot := &proxyRoot{
-		root:           root,
-		flattenStructs: append(flattenStructs, root),
+	proxyRoot.root = root
+	proxyRoot.flattenStructs = append(flattenStructs, root)
+	for _, value := range proxyRoot.pending {
+		strct := proxyRoot.flattenStructs[d.rand.Intn(len(proxyRoot.flattenStructs))]
+		strct.values = append(strct.values, value)
+		path := buildPath(strct, value.name).(*ast.SelectorExpr)
+		// The caller positioned the placeholder before this subtree existed.
+		// Preserve that site throughout the path so comments stay in place.
+		withPos(path.X, value.path.Sel.Pos())
+		value.path.X = path.X
+		for _, clone := range value.clones {
+			clone.X = cloneProxyPath(path.X)
+			withPos(clone.X, clone.Sel.Pos())
+		}
 	}
-	d.roots = append(d.roots, proxyRoot)
-	return proxyRoot
+	proxyRoot.pending = nil
 }
 
 // buildPath creates an AST expression that represents a field access path
@@ -126,24 +144,58 @@ func buildPath(strct *proxyStruct, valueName string) ast.Expr {
 	}
 }
 
+// cloneProxyPath keeps cached paths independent when callers assign positions.
+func cloneProxyPath(expr ast.Expr) ast.Expr {
+	switch expr := expr.(type) {
+	case *ast.Ident:
+		return ast.NewIdent(expr.Name)
+	case *ast.SelectorExpr:
+		return &ast.SelectorExpr{X: cloneProxyPath(expr.X), Sel: ast.NewIdent(expr.Sel.Name)}
+	default:
+		panic("unexpected proxy path")
+	}
+}
+
 func (d *proxyDispatcher) HideValue(val, typ ast.Expr) ast.Expr {
 	var root *proxyRoot
 	if len(d.roots) > 0 {
 		root = d.roots[len(d.roots)-1]
 	}
 	if root == nil || root.hiddenCount >= maxProxyValuesPerRoot {
-		root = d.initialize()
+		root = &proxyRoot{}
+		d.roots = append(d.roots, root)
 	}
 
-	strct := root.flattenStructs[d.rand.Intn(len(root.flattenStructs))]
-	valueName := d.nameFunc(d.rand, strct.name+"_"+strct.typeName+"_"+strconv.Itoa(len(strct.values)))
-	strct.values = append(strct.values, &proxyValue{
+	valueName := d.nameFunc(d.rand, "proxyRoot"+strconv.Itoa(len(d.roots)-1)+"Value"+strconv.Itoa(root.hiddenCount))
+	// Callers embed this selector before occupancy is known. Keep its identity
+	// and field position when the final randomized path is attached.
+	path := &ast.SelectorExpr{X: ast.NewIdent("pendingProxy"), Sel: ast.NewIdent(valueName)}
+	value := &proxyValue{
 		name: valueName,
 		typ:  typ,
 		val:  val,
-	})
+		path: path,
+	}
+	root.pending = append(root.pending, value)
+	if d.pendingPaths == nil {
+		d.pendingPaths = make(map[*ast.SelectorExpr]*proxyValue)
+	}
+	d.pendingPaths[path] = value
 	root.hiddenCount++
-	return buildPath(strct, valueName)
+	return path
+}
+
+// Cloned placeholders must receive the final path at their own source site.
+func (d *proxyDispatcher) clonePath(expr ast.Expr) ast.Expr {
+	clone := cloneProxyPath(expr)
+	if selector, ok := expr.(*ast.SelectorExpr); ok {
+		if value := d.pendingPaths[selector]; value != nil {
+			path := clone.(*ast.SelectorExpr)
+			value.clones = append(value.clones, path)
+			d.pendingPaths[path] = value
+		}
+	}
+	return clone
 }
 
 func (d *proxyDispatcher) generateStructLiteral(s *proxyStruct) ast.Expr {
@@ -207,7 +259,8 @@ func (d *proxyDispatcher) AddToFile(file *ast.File) {
 		return
 	}
 
-	for _, root := range d.roots {
+	for index, root := range d.roots {
+		d.initialize(root, index)
 		for _, strct := range root.flattenStructs {
 			dummyCount := d.rand.Intn(maxJunkValueCount-minJunkValueCount+1) + minJunkValueCount
 			for range dummyCount {

@@ -298,7 +298,7 @@ func generateLiterals(ts *testscript.TestScript, neg bool, args []string) {
 		)
 	}
 
-	// 5 huge literals past MaxSize, without uniqueLitString; not obfuscated.
+	// 5 huge literals past MaxSize exercise the bounded-AST decoder.
 	for range 5 {
 		size := literals.MaxSize + 1 + testRand.Intn(128<<10)
 		buffer := make([]byte, size)
@@ -308,7 +308,7 @@ func generateLiterals(ts *testscript.TestScript, neg bool, args []string) {
 			&ast.AssignStmt{
 				Lhs: []ast.Expr{ast.NewIdent("x")},
 				Tok: token.ADD_ASSIGN,
-				Rhs: []ast.Expr{ah.StringLit(string(buffer))},
+				Rhs: []ast.Expr{ah.StringLit(string(buffer) + uniqueLitString)},
 			},
 		)
 	}
@@ -634,6 +634,29 @@ func TestRuntimeGeneratedLinkerSymbols(t *testing.T) {
 		if !slices.Contains(builtinSymbols["runtime"], name) {
 			t.Errorf("runtime.%s must be included in the linker symbol map", name)
 		}
+	}
+}
+
+func TestTranslatedNameCheckSymbols(t *testing.T) {
+	for _, name := range []string{"quoted", "throw"} {
+		if !slices.Contains(builtinSymbols["runtime"], name) {
+			t.Errorf("runtime.%s must be in the symbol map so patched tools can translate the obfuscated name", name)
+		}
+	}
+	for _, name := range []string{
+		"LEUint16", "LEUint32", "LEUint64",
+		"BEUint16", "BEUint32", "BEUint64",
+		"LEPutUint16", "LEPutUint32", "LEPutUint64",
+		"BEPutUint16", "BEPutUint32", "BEPutUint64",
+		"LEAppendUint16", "LEAppendUint32", "LEAppendUint64",
+		"BEAppendUint16", "BEAppendUint32", "BEAppendUint64",
+	} {
+		if !slices.Contains(builtinSymbols["internal/byteorder"], name) {
+			t.Errorf("internal/byteorder.%s must be in the symbol map so the inliner recognizes it as cheap", name)
+		}
+	}
+	if !isToolchainNameDependency("internal/abi", "NoEscape") {
+		t.Error("internal/abi.NoEscape must keep its name so the inliner marks it as a cheap no-op call")
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"go/token"
 	"go/types"
 	mathrand "math/rand"
+	"strconv"
 	"unicode/utf8"
 
 	"golang.org/x/tools/go/ast/astutil"
@@ -21,7 +22,7 @@ import (
 // moderate, this also decreases the likelihood for performance slowdowns.
 const MinSize = 8
 
-// MaxSize is the upper limit of the size of string-like literals we will obfuscate.
+// MaxSize is the upper limit for the per-byte AST obfuscators.
 const MaxSize = 2 << 10 // 2 KiB
 
 // MaxSizeExpensive is the upper limit for using expensive obfuscators (split, seed).
@@ -38,9 +39,20 @@ const (
 // NameProviderFunc defines a function type that generates a string based on a random source and a base name.
 type NameProviderFunc func(rand *mathrand.Rand, baseName string) string
 
+// EmbeddedValue bypasses the minimum size threshold for resolved //go:embed data.
+type EmbeddedValue struct {
+	Data   []byte
+	String bool
+}
+
 // Obfuscate replaces literals with obfuscated anonymous functions.
-func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkStrings map[*types.Var]string, nameFunc NameProviderFunc) *ast.File {
+func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkStrings map[*types.Var]string, embeds map[ast.Expr]EmbeddedValue, nameFunc NameProviderFunc) *ast.File {
 	or := newObfRand(rand, file, nameFunc)
+	// Package initializers, including their function literals, keep a shared
+	// dispatcher. Each original function declaration gets a separate tree so
+	// a live function cannot retain another function's lifted decoders.
+	packageDispatcher := or.proxyDispatcher
+	dispatchers := []*proxyDispatcher{packageDispatcher}
 	pre := func(cursor *astutil.Cursor) bool {
 		switch node := cursor.Node().(type) {
 		case *ast.FuncDecl:
@@ -55,22 +67,53 @@ func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkString
 					}
 				}
 			}
+			// Cache decoder recipes only within an original function, including
+			// its nested closures, never across package initializer scopes.
+			or.stringCalls = make(map[string]*ast.CallExpr)
+			owner := len(dispatchers)
+			or.proxyDispatcher = newProxyDispatcher(rand, func(rand *mathrand.Rand, base string) string {
+				return nameFunc(rand, fmt.Sprintf("literalOwner%d_%s", owner, base))
+			})
+			dispatchers = append(dispatchers, or.proxyDispatcher)
 		case *ast.GenDecl:
 			// constants are obfuscated by replacing all references with the obfuscated value
 			if node.Tok == token.CONST {
 				return false
 			}
 		case *ast.ValueSpec:
-			for _, name := range node.Names {
+			hadValues := len(node.Values) > 0
+			for i, name := range node.Names {
 				obj := info.Defs[name].(*types.Var)
-				if _, e := linkStrings[obj]; e {
-					// Skip this entire ValueSpec to not break -ldflags=-X.
-					// TODO: support obfuscating those injected strings, too.
-					return false
+				value, ok := linkStrings[obj]
+				if !ok || !types.Identical(obj.Type(), types.Typ[types.String]) {
+					continue
 				}
+				if len(node.Values) == 0 {
+					for range node.Names {
+						node.Values = append(node.Values, &ast.BasicLit{Kind: token.STRING, Value: `""`})
+					}
+				} else if hadValues && (len(node.Values) != len(node.Names) || info.Types[node.Values[i]].Value == nil) {
+					// Like cmd/link, leave non-constant initializers alone.
+					continue
+				}
+				expr := ast.Expr(&ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(value)})
+				if len(value) >= MinSize && len(value) <= MaxSize {
+					expr = obfuscateString(or, value)
+				}
+				node.Values[i] = withPos(expr, name.Pos()).(ast.Expr)
 			}
 
 		case ast.Expr:
+			if value, ok := embeds[node]; ok {
+				var replacement ast.Node
+				if value.String {
+					replacement = obfuscateString(or, string(value.Data))
+				} else {
+					replacement = obfuscateByteSlice(or, false, value.Data)
+				}
+				cursor.Replace(withPos(replacement, node.Pos()))
+				return false
+			}
 			// A constant string converted to a byte or rune slice has an
 			// exact capacity. Decoding first can make the allocation larger.
 			if call, ok := node.(*ast.CallExpr); ok && len(call.Args) == 1 {
@@ -78,7 +121,7 @@ func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkString
 					elem := slice.Elem()
 					if value := info.Types[call.Args[0]].Value; value != nil && value.Kind() == constant.String {
 						text := constant.StringVal(value)
-						if len(text) >= MinSize && len(text) <= MaxSize {
+						if len(text) >= MinSize {
 							size := len(text)
 							if elem == types.Universe.Lookup("rune").Type() {
 								size = utf8.RuneCountInString(text)
@@ -131,19 +174,23 @@ func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkString
 			}
 			if typeAndValue.Type == types.Typ[types.String] {
 				value := constant.StringVal(typeAndValue.Value)
-				if len(value) >= MinSize && len(value) <= MaxSize {
+				if len(value) >= MinSize {
 					cursor.Replace(withPos(obfuscateString(or, value), node.Pos()))
 					return false
 				}
 			}
 			// Keep descending: a string constant we left alone, such as one
-			// above MaxSize or one of a named type, may still have operands
+			// below MinSize or one of a named type, may still have operands
 			// which we can rewrite.
 		}
 		return true
 	}
 
 	post := func(cursor *astutil.Cursor) bool {
+		if _, ok := cursor.Node().(*ast.FuncDecl); ok {
+			or.proxyDispatcher = packageDispatcher
+			or.stringCalls = nil
+		}
 		// Here we handle the plain []byte{...} or [4]byte{...} value form.
 		// The pointer form was already replaced on the way down; a literal
 		// which we declined there is declined here just the same.
@@ -157,7 +204,9 @@ func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkString
 
 	newFile := astutil.Apply(file, pre, post).(*ast.File)
 	newFile.Decls = append(newFile.Decls, or.liftedFuncs...)
-	or.proxyDispatcher.AddToFile(newFile)
+	for _, dispatcher := range dispatchers {
+		dispatcher.AddToFile(newFile)
+	}
 	return newFile
 }
 
@@ -277,7 +326,7 @@ func (r *obfRand) nextLiftedFuncName(base string) string {
 //
 // If the input node cannot be obfuscated nil is returned.
 func handleCompositeLiteral(or *obfRand, isPointer bool, node *ast.CompositeLit, info *types.Info) ast.Node {
-	if len(node.Elts) < MinSize || len(node.Elts) > MaxSize {
+	if len(node.Elts) < MinSize {
 		return nil
 	}
 
@@ -370,6 +419,9 @@ func withPos(node ast.Node, pos token.Pos) ast.Node {
 }
 
 func obfuscateString(or *obfRand, data string) *ast.CallExpr {
+	if call := or.stringCalls[data]; call != nil {
+		return or.proxyDispatcher.cloneStringCall(call).(*ast.CallExpr)
+	}
 	obf := or.pickObfuscator(len(data))
 
 	// Generate junk bytes to to prepend and append to the data.
@@ -387,51 +439,67 @@ func obfuscateString(or *obfRand, data string) *ast.CallExpr {
 	block := obf.obfuscate(or.rnd, names, plainDataWithJunkBytes, extKeys)
 	params, args := extKeysToParams(or, extKeys)
 
-	// Generate unique cast bytes to string function and hide it using proxyDispatcher:
-	//
-	// func(x []byte) string {
-	//		return string(x[<splitIdx>:<splitIdx+len(plainData)>])
-	//	}
-	funcTyp := &ast.FuncType{
-		Params: &ast.FieldList{List: []*ast.Field{{
-			Type: ah.ByteSliceType(),
-		}}},
-		Results: &ast.FieldList{List: []*ast.Field{{
-			Type: ast.NewIdent("string"),
-		}}},
-	}
-	funcVal := &ast.FuncLit{
-		Type: &ast.FuncType{
-			Params: &ast.FieldList{List: []*ast.Field{{
-				Names: []*ast.Ident{names.ident("x")},
-				Type:  ah.ByteSliceType(),
-			}}},
-			Results: &ast.FieldList{List: []*ast.Field{{
-				Type: ast.NewIdent("string"),
-			}}},
-		},
-		Body: ah.BlockStmt(
-			ah.ReturnStmt(
-				ah.CallExprByName("string",
-					&ast.SliceExpr{
-						X:    names.ident("x"),
-						Low:  ah.IntLit(splitIdx),
-						High: ah.IntLit(splitIdx + len(plainData)),
-					},
-				),
-			),
-		),
-	}
-	castFunc := or.liftFuncValue(funcVal)
-	hiddenCastFunc := or.proxyDispatcher.HideValue(castFunc, funcTyp)
+	hiddenCastFunc, funcTyp := or.stringConversionAdapter()
 	castParamName := names.name("garbleStringCaster")
 	params.List = append(params.List, &ast.Field{
 		Names: []*ast.Ident{ast.NewIdent(castParamName)},
 		Type:  cloneGeneratedType(funcTyp),
 	})
 	args = append(args, hiddenCastFunc)
-	block.List = append(block.List, ah.ReturnStmt(ah.CallExpr(ast.NewIdent(castParamName), names.ident("data"))))
-	return or.liftCall(params, ast.NewIdent("string"), block, args)
+	block.List = append(block.List, ah.ReturnStmt(ah.CallExpr(ast.NewIdent(castParamName), names.ident("data"), ah.IntLit(splitIdx), ah.IntLit(splitIdx+len(plainData)))))
+	call := or.liftCall(params, ast.NewIdent("string"), block, args)
+	if or.stringCalls != nil {
+		or.stringCalls[data] = call
+		return or.proxyDispatcher.cloneStringCall(call).(*ast.CallExpr)
+	}
+	return call
+}
+
+// Each use needs independent positions; only the hidden values and decoder are
+// shared, not mutable AST nodes or the result of running the decoder.
+func (d *proxyDispatcher) cloneStringCall(expr ast.Expr) ast.Expr {
+	switch expr := expr.(type) {
+	case *ast.CallExpr:
+		args := make([]ast.Expr, len(expr.Args))
+		for i, arg := range expr.Args {
+			args[i] = d.cloneStringCall(arg)
+		}
+		return &ast.CallExpr{Fun: d.cloneStringCall(expr.Fun), Args: args}
+	case *ast.SelectorExpr:
+		return d.clonePath(expr)
+	case *ast.Ident:
+		return ast.NewIdent(expr.Name)
+	case *ast.BasicLit:
+		return &ast.BasicLit{Kind: expr.Kind, Value: expr.Value}
+	default:
+		panic(fmt.Sprintf("unsupported string decoder expression %T", expr))
+	}
+}
+
+// stringConversionAdapter shares only within the current owner's dispatcher.
+// Bounds stay in each decoder, so junk and different literal lengths do not
+// require separate conversion functions.
+func (r *obfRand) stringConversionAdapter() (ast.Expr, *ast.FuncType) {
+	d := r.proxyDispatcher
+	if d.stringAdapter == nil {
+		names := newGeneratedNames(r)
+		funcVal := &ast.FuncLit{
+			Type: &ast.FuncType{
+				Params: &ast.FieldList{List: []*ast.Field{
+					ah.Field(ah.ByteSliceType(), names.ident("x")),
+					ah.Field(ast.NewIdent("int"), names.ident("low")),
+					ah.Field(ast.NewIdent("int"), names.ident("high")),
+				}},
+				Results: &ast.FieldList{List: []*ast.Field{{Type: ast.NewIdent("string")}}},
+			},
+			Body: ah.BlockStmt(ah.ReturnStmt(ah.CallExprByName("string", &ast.SliceExpr{
+				X: names.ident("x"), Low: names.ident("low"), High: names.ident("high"),
+			}))),
+		}
+		d.stringAdapterType = cloneGeneratedType(funcVal.Type).(*ast.FuncType)
+		d.stringAdapter = d.HideValue(r.liftFuncValue(funcVal), d.stringAdapterType)
+	}
+	return d.clonePath(d.stringAdapter), d.stringAdapterType
 }
 
 func obfuscateByteSlice(or *obfRand, isPointer bool, data []byte) *ast.CallExpr {
@@ -503,7 +571,7 @@ func obfuscateByteArray(or *obfRand, isPointer bool, data []byte, length int64) 
 
 func (or *obfRand) pickObfuscator(size int) obfuscator {
 	if size < MinSize || size > MaxSize {
-		panic(fmt.Sprintf("nextObfuscator called with size %d outside [%d, %d]", size, MinSize, MaxSize))
+		return blob{}
 	}
 	if or.testObfuscator != nil {
 		return or.testObfuscator

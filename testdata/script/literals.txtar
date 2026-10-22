@@ -20,9 +20,7 @@ cmp stderr main.stderr
 binsubstr main$exe 'Lorem Ipsum' 'dolor sit amet' 'second assign' 'First Line' 'Second Line' 'secret map value' 'obfuscated with shadowed builtins' '1: literal in' 'an secret array' '2: literal in' 'a secret slice' 'to obfuscate' 'also obfuscate' 'stringTypeField String' 'testMap1 key' 'Obfuscate this block' 'also obfuscate this' 'oversize concat secret'
 
 # Generate and write random literals into a separate file.
-# Some of them will be huge; assuming that we don't try to obfuscate them, the
-# test should generally run in under a second. If this test hangs for over ten
-# seconds, it means we're trying to obfuscate them.
+# Huge literals must use the bounded-AST decoder instead of per-byte expressions.
 generate-literals extra_literals.go
 
 # ensure we find the extra literals in an unobfuscated build
@@ -112,6 +110,8 @@ const padding512 = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
 const padding2048 = padding512 + padding512 + padding512 + padding512
 
 func main() {
+	checkRepeatedLiterals()
+	checkLiteralOwners()
 	if len(namedPayload) != cap(namedPayload) || namedPayload[0] != 'a' || namedPayload[len(namedPayload)-1] != 0xff {
 		panic("named byte slice literal changed")
 	}
@@ -127,8 +127,7 @@ func main() {
 	reassign = "second assign"
 
 	add := "totally long" + "unnecessarily added string"
-	// The concatenation is above MaxSize so it is left alone, but its typed
-	// operand below MaxSize must still be obfuscated.
+	// The folded concatenation uses the large-value decoder as a whole.
 	oversize := string("oversize concat secret") + padding2048
 
 	println(cnst, boolean)
@@ -178,6 +177,28 @@ type stringType string
 type stringTypeStruct struct {
 	str     string
 	strType stringType
+}
+
+func checkRepeatedLiterals() {
+	const text = "é界Ω repeated secret\x00\xff"
+	s := text
+	if func() string { return text }() != s || s[0] != 0xc3 || s[len(s)-1] != 0xff {
+		panic("repeated string changed")
+	}
+	a := []byte(text)
+	b := namedByteSlice(text)
+	c := []byte(text)
+	a[0] = 0
+	b[1] = 0
+	if c[0] != 0xc3 || c[1] != 0xa9 || c[len(c)-1] != 0xff || len(a) != cap(a) || len(b) != cap(b) || len(c) != cap(c) {
+		panic("repeated byte conversion changed or aliased")
+	}
+	r := []rune(text)
+	n := namedRuneSlice(text)
+	r[0] = 0
+	if n[0] != 'é' || n[len(n)-1] != '\ufffd' || len(r) != cap(r) || len(n) != cap(n) {
+		panic("repeated rune conversion changed or aliased")
+	}
 }
 
 // typedTest types defined from string broke previously
@@ -500,6 +521,63 @@ func str8() { println("foo bar bar") }
 
 //go:noinline
 func str9() { println("foo bar bar") }
+
+-- owners.go --
+package main
+
+var ownerEvents []string
+var ownerValue = ownerFunction()
+var ownerCallback = func() string { return "global callback owner" }
+var ownerCallbackValue = ownerCallback()
+var ownerMethodValue = ownerReceiver{}.message
+var ownerGenericValue = ownerGeneric(42)
+
+type ownerReceiver struct{}
+
+func (ownerReceiver) message() string { return "method literal owner" }
+
+func ownerFunction() string {
+	ownerEvents = append(ownerEvents, "function initialization")
+	return "function literal owner"
+}
+
+func ownerGeneric[T any](v T) string {
+	return func() string {
+		_ = v
+		return "generic literal owner"
+	}()
+}
+
+func ownerNested() func() string {
+	return func() string {
+		return func() string { return "nested literal owner" }()
+	}
+}
+
+func init() {
+	if ownerValue != "function literal owner" || ownerCallbackValue != "global callback owner" || ownerGenericValue != "generic literal owner" {
+		panic("literal owner initialization changed")
+	}
+	ownerEvents = append(ownerEvents, "first explicit init")
+}
+
+func init() {
+	ownerEvents = append(ownerEvents, "second explicit init")
+}
+
+// These declarations follow function declarations to exercise restoring the
+// package-initializer dispatcher after visiting a function body.
+var ownerTailValue = "tail global literal owner"
+var ownerTailCallback = func() string { return "tail callback literal owner" }
+
+func checkLiteralOwners() {
+	if len(ownerEvents) != 3 || ownerEvents[0] != "function initialization" || ownerEvents[1] != "first explicit init" || ownerEvents[2] != "second explicit init" {
+		panic("literal owner initialization order changed")
+	}
+	if ownerMethodValue() != "method literal owner" || ownerNested()() != "nested literal owner" || ownerTailValue != "tail global literal owner" || ownerTailCallback() != "tail callback literal owner" {
+		panic("literal owner result changed")
+	}
+}
 
 -- main.stderr --
 Lorem Ipsum true
