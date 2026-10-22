@@ -11,6 +11,7 @@ import (
 	"go/token"
 	"go/types"
 	mathrand "math/rand"
+	"reflect"
 	"strconv"
 	"unicode/utf8"
 
@@ -485,6 +486,7 @@ func (or *obfRand) sharedBlobStringCall(data string) *ast.CallExpr {
 		if err != nil {
 			panic(err)
 		}
+		clearNodePositions(parsed.Decls[0])
 		or.liftedFuncs = append(or.liftedFuncs, parsed.Decls...)
 	}
 	junkBytes := make([]byte, or.rnd.Intn(maxStringJunkBytes-minStringJunkBytes)+minStringJunkBytes)
@@ -494,6 +496,21 @@ func (or *obfRand) sharedBlobStringCall(data string) *ast.CallExpr {
 	plainWithJunk := append(append(junkBytes[:splitIdx], plain...), junkBytes[splitIdx:]...)
 	encoded := encodeSharedBlob(or.rnd, plainWithJunk)
 	return ah.CallExpr(ast.NewIdent(or.blobStringDecoder), ah.StringLit(string(encoded)), ah.IntLit(splitIdx), ah.IntLit(splitIdx+len(plain)))
+}
+
+// Parsed decoder positions belong to a temporary file set. Leave the lifted
+// function positionless so non-tiny source mapping treats it as generated code.
+func clearNodePositions(node ast.Node) {
+	positionType := reflect.TypeFor[token.Pos]()
+	for n := range ast.Preorder(node) {
+		value := reflect.ValueOf(n).Elem()
+		for i := range value.NumField() {
+			field := value.Field(i)
+			if field.CanSet() && field.Type() == positionType {
+				field.SetInt(0)
+			}
+		}
+	}
 }
 
 // The selected literal calls always contain a mode and a key followed by ciphertext.

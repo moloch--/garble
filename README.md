@@ -69,7 +69,7 @@ anti-virus scans incorrectly treating Go binaries as malware.
 
 Using the `-literals` flag causes literal expressions such as strings to be
 replaced with more complex expressions, resolving to the same value at run-time.
-String literals injected via `-ldflags=-X` are also replaced by this flag.
+Eligible string literals injected via `-ldflags=-X` are also replaced by this flag.
 This feature is opt-in, as it can cause slow-downs depending on the input code.
 
 `-literals-shared` requires `-literals` and uses one shared decoder per source
@@ -77,9 +77,12 @@ file for strings of at least 32 bytes. Each encoded string has its own random
 key, one of four reversible byte transforms, and no fixed marker. This can
 substantially reduce binary size when many long strings would otherwise have
 separate decoders. Those strings use a simpler, more easily reversed encoding.
-Shorter strings, byte slices, arrays, and `embed.FS` files retain their normal
-obfuscation. Long strings from `//go:embed` and `-ldflags=-X` also use the
-shared decoder. The flag is opt-in and defaults to off.
+Strings of 8–31 bytes, byte slices, arrays, and `embed.FS` files retain their
+existing obfuscation; source strings shorter than 8 bytes retain their existing
+handling. Embedded strings of at least 32 bytes use the shared
+decoder. Linker-injected `-X` values use it when they are 32–2,048 bytes; values
+outside Garble's existing 8–2,048 byte `-X` obfuscation range retain their
+existing handling. The flag is opt-in and defaults to off.
 
 Injected strings use the same size limits as source literals. Variables in the
 runtime and its dependencies are not covered. With `-literals`, `-ldflags` must

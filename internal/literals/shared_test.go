@@ -75,6 +75,22 @@ func TestSharedStringOption(t *testing.T) {
 	}
 }
 
+func TestSharedDecoderHasNoSourcePositions(t *testing.T) {
+	or := newObfRand(rand.New(rand.NewSource(7)), &ast.File{Name: ast.NewIdent("main")},
+		func(r *rand.Rand, base string) string { return fmt.Sprintf("%s%d", base, r.Uint64()) })
+	or.sharedStrings = true
+	or.sharedBlobStringCall(strings.Repeat("x", 32))
+
+	// Non-tiny source mapping recognizes generated functions only when every
+	// node is positionless. Parser positions belong to a different file set.
+	decoder := or.liftedFuncs[0].(*ast.FuncDecl)
+	for node := range ast.Preorder(decoder) {
+		if node.Pos().IsValid() {
+			t.Fatalf("generated shared decoder has source position %v in %T", node.Pos(), node)
+		}
+	}
+}
+
 func decodeSharedTest(encoded string) []byte {
 	keySize := BlobHeaderSize - len(BlobMagic)
 	mode := encoded[0]
