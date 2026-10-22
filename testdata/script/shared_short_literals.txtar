@@ -1,0 +1,40 @@
+! exec garble -literals-shared-short build
+stderr '-literals-shared-short requires -literals-shared'
+
+! exec garble -literals -literals-shared-short build
+stderr '-literals-shared-short requires -literals-shared'
+
+env LDFLAGS='-X=main.linked=LINKED_SHORT_2026'
+exec garble -literals -literals-shared -literals-shared-short -seed=MTIzNDU2Nzg build -ldflags=${LDFLAGS} -o short$exe
+exec ./short$exe
+cmp stderr want.stderr
+! binsubstr short$exe 'REPEAT_SHORT_2026' 'GLOBAL_SHORT_2026' 'LINKED_SHORT_2026' 'EMBEDDED_SHORT_2026'
+
+-- go.mod --
+module test/main
+
+go 1.23
+-- main.go --
+package main
+
+import _ "embed"
+
+var global = "GLOBAL_SHORT_2026"
+var linked = "LINKED_INITIAL_2026"
+
+//go:embed embedded.txt
+var embedded string
+
+func first() string { return "REPEAT_SHORT_2026" }
+func second() string { return "REPEAT_SHORT_2026" }
+
+func main() {
+	if len(embedded) < len("EMBEDDED_SHORT_2026") || embedded[:len("EMBEDDED_SHORT_2026")] != "EMBEDDED_SHORT_2026" {
+		panic("embedded string changed")
+	}
+	println(global, first(), first(), second(), linked)
+}
+-- embedded.txt --
+EMBEDDED_SHORT_2026
+-- want.stderr --
+GLOBAL_SHORT_2026 REPEAT_SHORT_2026 REPEAT_SHORT_2026 REPEAT_SHORT_2026 LINKED_SHORT_2026

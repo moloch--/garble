@@ -128,3 +128,48 @@ func TestEncodeSharedModes(t *testing.T) {
 		t.Fatalf("covered %d modes, want 4", len(seen))
 	}
 }
+
+func TestSharedShortStringsKeepIndependentEncodings(t *testing.T) {
+	or := newObfRand(rand.New(rand.NewSource(91)), &ast.File{Name: ast.NewIdent("main")},
+		func(r *rand.Rand, base string) string { return fmt.Sprintf("%s%d", base, r.Uint64()) })
+	or.sharedStrings = true
+	or.sharedShortStrings = true
+	value := "repeat-short-secret"
+	or.stringCalls = make(map[string]*ast.CallExpr)
+	var previous, previousKey string
+	for i := range 3 {
+		if i == 2 {
+			// The third use is in a different original function.
+			or.stringCalls = make(map[string]*ast.CallExpr)
+		}
+		call := obfuscateString(or, value)
+		if call.Fun.(*ast.Ident).Name != or.blobStringDecoder {
+			t.Fatal("short string did not use shared decoder")
+		}
+		encoded, err := strconv.Unquote(call.Args[0].(*ast.BasicLit).Value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if encoded == previous {
+			t.Fatal("repeated short string reused one encoding")
+		}
+		previous = encoded
+		keySize := BlobHeaderSize - len(BlobMagic)
+		key := encoded[1 : keySize+1]
+		if key == previousKey {
+			t.Fatal("repeated short string reused one key")
+		}
+		previousKey = key
+		low, err := strconv.Atoi(call.Args[1].(*ast.BasicLit).Value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		high, err := strconv.Atoi(call.Args[2].(*ast.BasicLit).Value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := string(decodeSharedTest(encoded)[low:high]); got != value {
+			t.Fatalf("decoded %q, want %q", got, value)
+		}
+	}
+}

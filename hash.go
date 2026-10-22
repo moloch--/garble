@@ -134,6 +134,9 @@ func appendFlags(w io.Writer, forBuildHash bool) {
 	if flagLiteralsShared {
 		io.WriteString(w, " -literals-shared")
 	}
+	if flagLiteralsSharedShort {
+		io.WriteString(w, " -literals-shared-short")
+	}
 	if flagTiny {
 		io.WriteString(w, " -tiny")
 	}

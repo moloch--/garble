@@ -113,15 +113,16 @@ var booleanFlags = map[string]bool{
 }
 
 var flagSet = flag.NewFlagSet("garble", flag.ExitOnError)
-var rxGarbleFlag = regexp.MustCompile(`-(?:literals|literals-shared|tiny|debug|debugdir|seed)(?:$|=)`)
+var rxGarbleFlag = regexp.MustCompile(`-(?:literals|literals-shared|literals-shared-short|tiny|debug|debugdir|seed)(?:$|=)`)
 
 var (
-	flagLiterals       bool
-	flagLiteralsShared bool
-	flagTiny           bool
-	flagDebug          bool
-	flagDebugDir       string
-	flagSeed           seedFlag
+	flagLiterals            bool
+	flagLiteralsShared      bool
+	flagLiteralsSharedShort bool
+	flagTiny                bool
+	flagDebug               bool
+	flagDebugDir            string
+	flagSeed                seedFlag
 	// TODO(pagran): in the future, when control flow obfuscation will be stable migrate to flag
 	flagControlFlow = os.Getenv("GARBLE_EXPERIMENTAL_CONTROLFLOW") == "1"
 
@@ -135,6 +136,7 @@ func init() {
 	flagSet.Usage = usage
 	flagSet.BoolVar(&flagLiterals, "literals", false, "Obfuscate literals and embedded files")
 	flagSet.BoolVar(&flagLiteralsShared, "literals-shared", false, "Share a mixed-operation decoder across strings of at least 32 bytes (requires -literals; smaller binaries with weaker literal obfuscation)")
+	flagSet.BoolVar(&flagLiteralsSharedShort, "literals-shared-short", false, "Extend the shared mixed-operation decoder to strings of at least 8 bytes (requires -literals-shared; smaller binaries with weaker short literal obfuscation)")
 	flagSet.BoolVar(&flagTiny, "tiny", false, "Optimize for binary size, losing some ability to reverse the process")
 	flagSet.BoolVar(&flagDebug, "debug", false, "Print debug logs to stderr")
 	flagSet.StringVar(&flagDebugDir, "debugdir", "", "Write source and obfuscated trees to a directory, e.g. -debugdir=out")
@@ -225,6 +227,9 @@ func mainErr(args []string) error {
 	command, args := args[0], args[1:]
 	if flagLiteralsShared && !flagLiterals {
 		return fmt.Errorf("-literals-shared requires -literals")
+	}
+	if flagLiteralsSharedShort && !flagLiteralsShared {
+		return fmt.Errorf("-literals-shared-short requires -literals-shared")
 	}
 
 	// Catch users reaching for `go build -toolexec=garble`.

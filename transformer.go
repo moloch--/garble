@@ -1565,7 +1565,7 @@ func (tf *transformer) transformGoFile(file *ast.File) *ast.File {
 	// and that's not allowed in the runtime itself.
 	if flagLiterals && tf.curPkg.toObfuscate() && !isRuntimePkgPath(tf.curPkg.ImportPath) {
 		file = literals.ObfuscateWithOptions(tf.obfRand, file, tf.info, tf.linkerVariableStrings, tf.embeddedValues, randomName,
-			literals.Options{SharedStrings: flagLiteralsShared})
+			literals.Options{SharedStrings: flagLiteralsShared, SharedShortStrings: flagLiteralsSharedShort})
 
 		// some imported constants might not be needed anymore, remove unnecessary imports
 		tf.useAllImports(file)
