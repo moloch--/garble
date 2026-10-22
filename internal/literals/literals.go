@@ -44,7 +44,8 @@ type NameProviderFunc func(rand *mathrand.Rand, baseName string) string
 // Options selects optional literal transformations. The zero value preserves
 // Garble's default literal obfuscation.
 type Options struct {
-	SharedStrings bool
+	SharedStrings      bool
+	SharedShortStrings bool
 }
 
 // EmbeddedValue bypasses the minimum size threshold for resolved //go:embed data.
@@ -62,6 +63,7 @@ func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkString
 func ObfuscateWithOptions(rand *mathrand.Rand, file *ast.File, info *types.Info, linkStrings map[*types.Var]string, embeds map[ast.Expr]EmbeddedValue, nameFunc NameProviderFunc, options Options) *ast.File {
 	or := newObfRand(rand, file, nameFunc)
 	or.sharedStrings = options.SharedStrings
+	or.sharedShortStrings = options.SharedShortStrings
 	// Package initializers, including their function literals, keep a shared
 	// dispatcher. Each original function declaration gets a separate tree so
 	// a live function cannot retain another function's lifted decoders.
@@ -433,12 +435,17 @@ func withPos(node ast.Node, pos token.Pos) ast.Node {
 }
 
 func obfuscateString(or *obfRand, data string) *ast.CallExpr {
-	if call := or.stringCalls[data]; call != nil {
-		return or.proxyDispatcher.cloneStringCall(call).(*ast.CallExpr)
+	// The short-string option keeps a fresh encoded input at every call site,
+	// including repeated values in the same original function.
+	independent := or.sharedStrings && or.sharedShortStrings
+	if !independent {
+		if call := or.stringCalls[data]; call != nil {
+			return or.proxyDispatcher.cloneStringCall(call).(*ast.CallExpr)
+		}
 	}
-	if or.sharedStrings && len(data) >= 32 {
+	if or.sharedStrings && (len(data) >= 32 || or.sharedShortStrings && len(data) >= MinSize) {
 		call := or.sharedBlobStringCall(data)
-		if or.stringCalls != nil {
+		if or.stringCalls != nil && !independent {
 			or.stringCalls[data] = call
 			return or.proxyDispatcher.cloneStringCall(call).(*ast.CallExpr)
 		}
@@ -470,7 +477,7 @@ func obfuscateString(or *obfRand, data string) *ast.CallExpr {
 	args = append(args, hiddenCastFunc)
 	block.List = append(block.List, ah.ReturnStmt(ah.CallExpr(ast.NewIdent(castParamName), names.ident("data"), ah.IntLit(splitIdx), ah.IntLit(splitIdx+len(plainData)))))
 	call := or.liftCall(params, ast.NewIdent("string"), block, args)
-	if or.stringCalls != nil {
+	if or.stringCalls != nil && !independent {
 		or.stringCalls[data] = call
 		return or.proxyDispatcher.cloneStringCall(call).(*ast.CallExpr)
 	}

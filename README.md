@@ -84,6 +84,13 @@ decoder. Linker-injected `-X` values use it when they are 32–2,048 bytes; valu
 outside Garble's existing 8–2,048 byte `-X` obfuscation range retain their
 existing handling. The flag is opt-in and defaults to off.
 
+`-literals-shared-short` requires `-literals-shared` and extends the shared
+decoder to strings of at least 8 bytes. Each literal use gets its own random
+key, transform mode, and encoded bytes, including repeated values in one
+function. This can further reduce binary size, with the same simpler
+encoding applied to short strings. Byte slices, arrays, and `embed.FS` files
+retain their normal obfuscation. The flag is opt-in and defaults to off.
+
 Injected strings use the same size limits as source literals. Variables in the
 runtime and its dependencies are not covered. With `-literals`, `-ldflags` must
 be unpatterned; build commands separately if they need different injected values.
